@@ -30,6 +30,7 @@ const dragStartX = ref(0); // 新增：记录拖动开始时的X坐标
 const dragStartY = ref(0); // 新增：记录拖动开始时的Y坐标
 const dragThreshold = 5; // 拖动阈值，单位为像素
 const isDraggingForPlacement = ref(false); // 新增：用于判断是否为放置像素的拖动
+const hasDragged = ref(false); // 鼠标按下后是否已越过阈值，进入真正拖动
 
 const dragScaleX = ref(1); // 新增：拖拽时的水平比例修正
 const dragScaleY = ref(1); // 新增：拖拽时的垂直比例修正
@@ -140,6 +141,13 @@ onMounted(async () => {
   // 获取并绘制最新图片，完成后执行更新
   await fetchAndDrawLatestImage();
   fetchAndDrawUpdate();
+
+  // 像素网格覆盖层：容器尺寸变化时重绘，并执行一次初次绘制
+  if (typeof ResizeObserver !== 'undefined' && containerRef.value) {
+    gridResizeObserver = new ResizeObserver(scheduleDrawGrid);
+    gridResizeObserver.observe(containerRef.value);
+  }
+  scheduleDrawGrid();
 });
 
 onBeforeUnmount(() => {
@@ -157,6 +165,8 @@ onBeforeUnmount(() => {
   }
   ws.off('pixel_update', handlePixelUpdate);
   cooldownEventBus.off(handleCooldownEvent)
+  if (gridResizeObserver) gridResizeObserver.disconnect();
+  if (gridRafId) cancelAnimationFrame(gridRafId);
 });
 
 
@@ -199,6 +209,7 @@ function handleWheel(event) {
 // ============ 拖拽（像素空间平移） ============
 function handleMouseDown(event) {
   isDragging.value = true;
+  hasDragged.value = false; // 按下时先进入待判定状态，未越过阈值前不平移
   lastX.value = event.clientX;
   lastY.value = event.clientY;
   dragStartX.value = event.clientX; // 记录拖动开始位置
@@ -237,6 +248,17 @@ function handleMouseMove(event) {
 
   if (!isDragging.value) return;
 
+  // 未越过阈值前不平移，避免点击时的细微抖动被当成拖动
+  if (!hasDragged.value) {
+    const dx = event.clientX - dragStartX.value;
+    const dy = event.clientY - dragStartY.value;
+    if (dx * dx + dy * dy <= dragThreshold * dragThreshold) return;
+    // 越过阈值，正式开始拖动；同步基准点，避免把判定期间的位移一次性补上
+    hasDragged.value = true;
+    lastX.value = event.clientX;
+    lastY.value = event.clientY;
+  }
+
   // 计算物理位移
   const rawDx = event.clientX - lastX.value;
   const rawDy = event.clientY - lastY.value;
@@ -257,16 +279,13 @@ function handleMouseMove(event) {
 }
 
 function handleMouseUp() {
-  // 检查鼠标释放位置与初始点击位置的距离
-  const deltaX = Math.abs(lastX.value - dragStartX.value);
-  const deltaY = Math.abs(lastY.value - dragStartY.value);
-  
-  // 如果移动距离超过阈值，则认为是拖动
-  if (deltaX > dragThreshold || deltaY > dragThreshold) {
+  // 越过过阈值才算拖动，抑制点击放置
+  if (hasDragged.value) {
     isDraggingForPlacement.value = true;
   }
-  
+
   isDragging.value = false;
+  hasDragged.value = false;
   if (canvasRef.value) {
     canvasRef.value.style.cursor = isCoolingDown.value ? 'not-allowed' : 'pointer';
   }
@@ -289,20 +308,67 @@ function updateHoverPixel(event) {
   }
 }
 
-// 悬停高亮样式
-const highlightStyle = computed(() => {
-  if (props.isMobile || hoverPixelX.value < 0 || hoverPixelY.value < 0 || isCoolingDown.value || isInteracting.value) return null;
-  const ps = props.pixelSize;
-  const s = scale.value;
-  const tx = translateX.value + hoverPixelX.value * ps * s;
-  const ty = translateY.value + hoverPixelY.value * ps * s;
-  const size = ps * s;
-  return {
-    transform: `translate(${tx}px, ${ty}px)`,
-    width: `${size}px`,
-    height: `${size}px`,
-  };
-});
+// 像素网格：仅在放大到单像素屏幕尺寸 >= 阈值时显示
+// 用独立 canvas 覆盖层在屏幕空间画 1 设备像素的硬边线条，并按设备像素取整，
+// 与像素化画布的硬边对齐，避免 CSS 渐变抗锯齿在分数缩放/平移下产生的亚像素偏移
+const GRID_THRESHOLD = 8; // 单像素在屏幕上 >= 8px 时才画网格
+const showGrid = computed(() => props.pixelSize * scale.value >= GRID_THRESHOLD);
+
+const gridCanvasRef = ref(null);
+let gridRafId = 0;
+let gridResizeObserver = null;
+
+function scheduleDrawGrid() {
+  if (gridRafId) return;
+  gridRafId = requestAnimationFrame(() => {
+    gridRafId = 0;
+    drawGrid();
+  });
+}
+
+function drawGrid() {
+  const canvas = gridCanvasRef.value;
+  const container = containerRef.value;
+  if (!canvas || !container) return;
+  const gctx = canvas.getContext('2d');
+  if (!gctx) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = container.clientWidth;
+  const cssH = container.clientHeight;
+  const bmpW = Math.max(1, Math.floor(cssW * dpr));
+  const bmpH = Math.max(1, Math.floor(cssH * dpr));
+  // 仅在位图尺寸变化时重设，避免每次重绘都清空
+  if (canvas.width !== bmpW || canvas.height !== bmpH) {
+    canvas.width = bmpW;
+    canvas.height = bmpH;
+  }
+
+  gctx.clearRect(0, 0, bmpW, bmpH);
+  if (!showGrid.value) return;
+
+  const cell = props.pixelSize * scale.value; // 单像素屏幕尺寸（CSS px）
+  const tx = translateX.value;
+  const ty = translateY.value;
+  gctx.fillStyle = 'rgba(0, 0, 0, 0.12)';
+
+  // 竖线：屏幕 x = tx + k*cell，按设备像素取整对齐像素边缘
+  const kMin = Math.ceil(-tx / cell);
+  const kMax = Math.floor((cssW - tx) / cell);
+  for (let k = kMin; k <= kMax; k++) {
+    const x = Math.floor((tx + k * cell) * dpr);
+    gctx.fillRect(x, 0, 1, bmpH);
+  }
+  // 横线
+  const jMin = Math.ceil(-ty / cell);
+  const jMax = Math.floor((cssH - ty) / cell);
+  for (let j = jMin; j <= jMax; j++) {
+    const y = Math.floor((ty + j * cell) * dpr);
+    gctx.fillRect(0, y, bmpW, 1);
+  }
+}
+
+watch([scale, translateX, translateY, () => props.pixelSize], scheduleDrawGrid, { flush: 'post' });
 
 // 中央准星（移动端）
 const crosshairPixel = computed(() => {
@@ -466,6 +532,9 @@ function placeAtPoint(clientX, clientY) {
 
   if (x >= 0 && x < props.width && y >= 0 && y < props.height) {
     ws.send('pixel_place', { x, y, color: props.selectedColor });
+    // 乐观绘制：本地立即画上，避免等待服务端广播往返（通常 500ms+）造成的卡顿。
+    // 服务端广播回来时会以同色重绘同一像素，幂等无副作用。
+    drawPixel(x, y, props.selectedColor);
     emit('pixel-placed');
   }
 }
@@ -491,6 +560,8 @@ function placeAtCrosshair() {
   const pos = getCrosshairPixel();
   if (!pos) return false;
   ws.send('pixel_place', { x: pos.x, y: pos.y, color: props.selectedColor });
+  // 乐观绘制（同 placeAtPoint）
+  drawPixel(pos.x, pos.y, props.selectedColor);
   emit('pixel-placed');
   return true;
 }
@@ -783,11 +854,10 @@ defineExpose({
       class="pixel-canvas"
       :style="{ ...canvasTransformStyle, cursor: canvasCursor }"
     ></canvas>
-    <div
-      v-if="highlightStyle"
-      class="pixel-highlight"
-      :style="highlightStyle"
-    ></div>
+    <canvas
+      ref="gridCanvasRef"
+      class="pixel-grid-canvas"
+    ></canvas>
     <div
       v-if="crosshairStyle"
       class="crosshair"
@@ -821,14 +891,15 @@ defineExpose({
   -webkit-user-select: none;
 }
 
-.pixel-highlight {
+.pixel-grid-canvas {
   position: absolute;
   top: 0;
   left: 0;
-  background: rgba(99, 102, 241, 0.3);
-  border: 1.5px solid rgba(99, 102, 241, 0.8);
+  width: 100%;
+  height: 100%;
+  display: block;
   pointer-events: none;
-  z-index: 1;
+  z-index: 2;
 }
 
 .crosshair {
