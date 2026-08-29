@@ -1,128 +1,83 @@
-// WebSocket连接管理工具
 class WSClient {
   constructor() {
     this.ws = null;
     this.listeners = {};
-    this.reconnectInterval = 5000; // 5秒重连间隔
-    this.maxReconnectAttempts = 5;
+    this.url = null;
     this.reconnectAttempts = 0;
+    this.maxReconnectDelay = 10000;
+    this.manuallyClosed = false;
   }
 
-  /**
-   * 连接到WebSocket服务器
-   * @param {string} url - WebSocket服务器地址
-   */
-  connect(url) {
-    this.ws = new WebSocket(url);
-    
-    this.ws.onopen = (event) => {
-      console.log('WebSocket连接已建立');
-      this.reconnectAttempts = 0; // 重置重连次数
+  async connect(url) {
+    this.url = url;
+    this.manuallyClosed = false;
+    try {
+      // V2 requires this signed anonymous cookie before a socket is accepted.
+      const response = await fetch('/api/v2/session', { credentials: 'same-origin' });
+      if (!response.ok) throw new Error('无法创建匿名会话');
+      this._open();
+    } catch (error) {
+      this.emit('error', error);
+      this._scheduleReconnect();
+    }
+  }
+
+  _open() {
+    if (this.manuallyClosed || !this.url) return;
+    this.ws = new WebSocket(this.url);
+    this.ws.onopen = event => {
+      this.reconnectAttempts = 0;
       this.emit('open', event);
     };
-    
-    this.ws.onmessage = (event) => {
+    this.ws.onmessage = event => {
       try {
         const message = JSON.parse(event.data);
-        if (message.type === "pixel_update") {
-          this.emit('pixel_update', message.data);
-        } else if (message.type === "limited") {
-          this.emit('limited', message.data);
-        } else if (message.type === "visit_stats") {
-          this.emit('stats', message.data);
-        }
+        if (!message || typeof message.type !== 'string') return;
+        this.emit(message.type, message);
+        if (message.type === 'stats.updated') this.emit('stats', message.data);
+        if (message.type === 'error') this.emit('server_error', message);
       } catch (error) {
-        console.error('解析WebSocket消息失败:', error);
+        this.emit('error', error);
       }
     };
-    
-    this.ws.onclose = (event) => {
-      console.log('WebSocket连接已关闭', event);
+    this.ws.onclose = event => {
       this.emit('close', event);
-      
-      // 尝试重连
-      if (this.reconnectAttempts < this.maxReconnectAttempts) {
-        this.reconnectAttempts++;
-        console.log(`尝试重连 (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
-        setTimeout(() => this.connect(url), this.reconnectInterval);
-      }
+      if (!this.manuallyClosed) this._scheduleReconnect();
     };
-    
-    this.ws.onerror = (error) => {
-      console.error('WebSocket错误:', error);
-      this.emit('error', error);
-    };
+    this.ws.onerror = error => this.emit('error', error);
   }
 
-  /**
-   * 发送消息到服务器
-   * @param {string} type - 消息类型
-   * @param {Object} data - 消息数据
-   */
-  send(type, data) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      let message = null;
-      if (type === 'pixel_place') {
-        message = {
-          type: "pixel_update",
-          data: {
-            x: data.x,
-            y: data.y,
-            color: data.color
-          }
-        };
-      } else {
-        message = { type, data };
-      }
-      this.ws.send(JSON.stringify(message));
-    } else {
-      console.warn('WebSocket未连接，无法发送消息');
-    }
+  _scheduleReconnect() {
+    if (this.manuallyClosed) return;
+    const delay = Math.min(1000 * (2 ** this.reconnectAttempts), this.maxReconnectDelay);
+    this.reconnectAttempts += 1;
+    window.setTimeout(() => this.connect(this.url), delay);
   }
 
-  /**
-   * 添加事件监听器
-   * @param {string} event - 事件类型
-   * @param {Function} callback - 回调函数
-   */
+  send(type, data = {}, requestId = null) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    const payload = { type, data };
+    if (requestId) payload.request_id = requestId;
+    this.ws.send(JSON.stringify(payload));
+    return true;
+  }
+
   on(event, callback) {
-    if (!this.listeners[event]) {
-      this.listeners[event] = [];
-    }
-    this.listeners[event].push(callback);
+    (this.listeners[event] ||= []).push(callback);
   }
 
-  /**
-   * 移除事件监听器
-   * @param {string} event - 事件类型
-   * @param {Function} callback - 回调函数
-   */
   off(event, callback) {
-    if (this.listeners[event]) {
-      this.listeners[event] = this.listeners[event].filter(cb => cb !== callback);
-    }
+    if (this.listeners[event]) this.listeners[event] = this.listeners[event].filter(item => item !== callback);
   }
 
-  /**
-   * 触发事件监听器
-   * @param {string} event - 事件类型
-   * @param {any} data - 数据
-   */
-  emit(event, data) {
-    if (this.listeners[event]) {
-      this.listeners[event].forEach(callback => callback(data));
-    }
+  emit(event, value) {
+    (this.listeners[event] || []).slice().forEach(callback => callback(value));
   }
 
-  /**
-   * 关闭WebSocket连接
-   */
   close() {
-    if (this.ws) {
-      this.ws.close();
-    }
+    this.manuallyClosed = true;
+    if (this.ws) this.ws.close();
   }
 }
 
-// 导出单例实例
 export default new WSClient();

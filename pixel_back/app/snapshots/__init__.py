@@ -1,0 +1,1 @@
+"""Threshold-driven canvas snapshotting."""

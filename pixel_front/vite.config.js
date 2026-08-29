@@ -1,24 +1,28 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
-// https://vitejs.dev/config/
 export default defineConfig({
   plugins: [vue()],
   server: {
-    host: '0.0.0.0',  // 允许外部设备访问
-    port: 8080,       // 端口号，可以按需修改
-    // 本地开发时代理到线上后端（生产环境由 Nginx 处理）
+    host: '0.0.0.0',
+    port: 8080,
     proxy: {
       '/api': {
-        target: 'https://pixel-asoul.club',
-        changeOrigin: true,
-        secure: false
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true
       },
       '/ws': {
-        target: 'wss://pixel-asoul.club',
+        target: 'ws://127.0.0.1:8000',
         changeOrigin: true,
-        secure: false,
-        ws: true,
+        ws: true
+      }
+    }
+  },
+  build: {
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        admin: 'admin.html'
       }
     }
   }

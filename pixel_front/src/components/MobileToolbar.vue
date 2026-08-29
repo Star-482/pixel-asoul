@@ -9,11 +9,15 @@ const props = defineProps({
   crosshairCoord: { type: Object, default: null }
 });
 
-const emit = defineEmits(['open-color-picker', 'place-pixel', 'toggle-crosshair', 'select-color']);
+const emit = defineEmits(['open-color-picker', 'place-pixel', 'pick-color', 'toggle-crosshair']);
 
 const showToast = inject('showToast');
 
 function handlePlace() {
+  if (props.disabled) {
+    showToast?.('当前画布仅允许浏览', 'warning');
+    return;
+  }
   if (props.cooldownSeconds > 0) {
     showToast?.(`冷却中，请等待 ${props.cooldownSeconds} 秒`, 'warning');
     return;
@@ -25,35 +29,26 @@ function handlePlace() {
   emit('place-pixel');
 }
 
-async function activateEyedropper() {
-  if (!('EyeDropper' in window)) {
-    showToast?.('您的浏览器不支持吸管工具，请使用 Chrome 95+', 'warning');
+function handlePickColor() {
+  if (!props.isCrosshairMode) {
+    showToast?.('请先开启准星模式，再从画布取色', 'warning');
     return;
   }
-
-  try {
-    const eyeDropper = new window.EyeDropper();
-    const result = await eyeDropper.open();
-    emit('select-color', result.sRGBHex);
-    showToast?.('已吸取颜色', 'success');
-  } catch (error) {
-    // 用户取消或出错，无需提示
-    console.log('吸管工具操作被取消或出现错误:', error);
-  }
+  emit('pick-color');
 }
 </script>
 
 <template>
   <div class="mobile-toolbar">
     <div class="left-tools">
-      <!-- 吸管工具 -->
+      <!-- 画布内取色，不依赖浏览器的 EyeDropper API。 -->
       <button
         class="tool-btn eyedropper-btn"
-        @click="activateEyedropper"
-        aria-label="吸管工具"
-        title="吸管工具"
+        @click="handlePickColor"
+        aria-label="从画布取色"
+        title="从准星位置取色"
       >
-        <span class="icon">💉</span>
+        <span class="icon">🔍</span>
       </button>
 
       <!-- 颜色选择器入口 -->
@@ -71,11 +66,12 @@ async function activateEyedropper() {
     <button
       class="place-btn"
       :class="{ cooling: cooldownSeconds > 0, disabled }"
+      :disabled="disabled || cooldownSeconds > 0"
       @click="handlePlace"
     >
       <span class="place-icon">✏️</span>
       <span class="place-text">
-        {{ cooldownSeconds > 0 ? `冷却 ${cooldownSeconds}s` : '放置像素' }}
+        {{ disabled ? '仅浏览' : cooldownSeconds > 0 ? `冷却 ${cooldownSeconds}s` : '放置像素' }}
       </span>
     </button>
 

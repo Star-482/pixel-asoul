@@ -5,17 +5,12 @@ import sys
 logger = logging.getLogger("pixel_canvas")
 logger.setLevel(logging.INFO)
 
-# Create console handler and set level to info
-handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(handler)
 
-# Create formatter
-formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-
-# Add formatter to handler
-handler.setFormatter(formatter)
-
-# Add handler to logger
-logger.addHandler(handler)
+logger.propagate = False

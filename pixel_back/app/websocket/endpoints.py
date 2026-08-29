@@ -1,93 +1,178 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from app.redis_store.canvas import CanvasStore
-from app.schemas.events import PixelUpdateEvent
-from app.utils.logger import logger
-import app.deps as deps
-from redis import asyncio as aioredis
-import json
-import time
-import asyncio
-from app.services.canvas_service import CanvasService, create_snapshot_background
-from app.services.stats_service import StatsService
-from app.utils.utils import extract_client_ip_from_websocket
-from app.websocket.manager import ConnectionManager, RateLimiter
-from datetime import datetime
-from app.config import MAX_REQUESTS,WINDOW_SIZE_SECONDS,CLEANUP_INTERVAL_MINUTES
+from __future__ import annotations
 
-# Create connection manager for this module
-manager = ConnectionManager()
-limiter = RateLimiter(max_requests=MAX_REQUESTS, window_size_seconds=WINDOW_SIZE_SECONDS, cleanup_interval_minutes=CLEANUP_INTERVAL_MINUTES)
+from uuid import uuid4
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
+
+from app.canvas.model import PixelCommand
+from app.canvas.service import CanvasRejected
+from app.core.events import ConnectionClosed, VisitCommitted
+from app.core.runtime import ApplicationRuntime
+from app.db import repositories
+from app.realtime.hub import RealtimeConnection
+from app.realtime.protocol import IncomingMessage, ProtocolError, error_payload, parse_message
+from app.schemas.websocket import ChallengeVerifyData, PixelPlaceData
+from app.utils.utils import extract_client_ip_from_websocket
+
 
 router = APIRouter()
 
 
-@router.websocket("/ws/canvas")
-async def canvas_websocket(websocket: WebSocket):
-    """WebSocket endpoint for canvas updates."""
-    # 初始化Redis连接用于pub/sub
-    await manager.init_redis()
-    connection_id = await manager.connect(websocket)
-    client_ip = extract_client_ip_from_websocket(websocket)
-    # Get Redis connection from pool
-    redis = aioredis.Redis(connection_pool=deps.redis_pool)
-    canvas_store = CanvasStore(redis)
-    stats_service = StatsService(redis)
+def _origin_is_allowed(websocket: WebSocket, origins: tuple[str, ...]) -> bool:
+    if not origins:
+        return True
+    return (websocket.headers.get('origin') or '').rstrip('/') in origins
 
-    # Track connection-based counters in Redis
-    await manager.broadcast(json.dumps({"type": "visit_stats", "data": await stats_service.handle_connect(client_ip)}))
 
+@router.websocket('/ws/canvas')
+async def canvas_websocket(websocket: WebSocket) -> None:
+    runtime: ApplicationRuntime = websocket.app.state.runtime
+    if not _origin_is_allowed(websocket, runtime.settings.allowed_origins):
+        await websocket.close(code=1008, reason='Origin is not allowed')
+        return
+    visitor_id = runtime.identity.verify(websocket.cookies.get(runtime.identity.COOKIE_NAME))
+    if visitor_id is None:
+        await websocket.accept()
+        await websocket.send_json(error_payload('session_required', '请先创建匿名会话'))
+        await websocket.close(code=1008, reason='session required')
+        return
+    if not runtime.health.ready or runtime.health.draining:
+        await websocket.close(code=1013, reason='service unavailable')
+        return
+
+    connection: RealtimeConnection | None = None
+    visit_id: int | None = None
+    online_opened = False
+    connection_id = str(uuid4())
+    client_ip = extract_client_ip_from_websocket(websocket, runtime.settings.trust_proxy_headers) or 'unknown'
     try:
-        while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            # 检查是否允许发送新请求
-            is_allowed = await limiter.is_allowed(connection_id)
-            if not is_allowed:
-                request_times, _ = limiter.clients[connection_id]
-                limit_time = WINDOW_SIZE_SECONDS - int((datetime.now() - request_times[0]).total_seconds())
-                await manager.send_personal_message(
-                    json.dumps({
-                        "type": "limited",
-                        "data": {
-                            "error_message": "频率过高，请稍后",
-                            "limit_time": limit_time
-                        }
-                    }),
-                    websocket
+        async with runtime.session_factory() as session:
+            async with session.begin():
+                visit = await repositories.create_visit(
+                    session, visitor_id=visitor_id, connection_id=connection_id, ip=client_ip
                 )
+                visit_id = visit.id
+                counters = await repositories.get_counters(session)
+        stats = runtime.stats.visit_committed(counters.total_visits)
+        stats = await runtime.stats.connection_opened()
+        online_opened = True
+        # Snapshot choice and head high-water are captured while a writer cannot
+        # commit, so the first server message defines a lossless catch-up range.
+        async with runtime.canvas_state.write_lock:
+            head = runtime.canvas_state.head_event_id
+            async with runtime.session_factory() as session:
+                snapshot = await repositories.get_snapshot_at_or_before(session, head)
+            ready = {
+                'type': 'session.ready',
+                'data': {
+                    'session_id': connection_id,
+                    'head_event_id': head,
+                    'draw_enabled': not runtime.canvas.read_only,
+                    'canvas': {'width': runtime.settings.canvas_width, 'height': runtime.settings.canvas_height},
+                    'snapshot': None if snapshot is None else {
+                        'id': snapshot.id, 'last_event_id': snapshot.last_log_id,
+                        'url': f'/api/v2/canvas/snapshots/{snapshot.id}.png',
+                    },
+                    'stats': stats.as_dict(),
+                },
+            }
+            connection = await runtime.hub.register(websocket, visitor_id, ready, connection_id=connection_id)
+            connection.visit_id = visit_id
+        runtime.dispatcher.publish_nowait(VisitCommitted(stats.as_dict()))
+
+        assert connection is not None
+        assert visit_id is not None
+
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                runtime.abuse.allow_message(connection.id)
+                message = parse_message(raw, runtime.settings.ws_max_message_bytes)
+            except ProtocolError as error:
+                await runtime.hub.send(connection.id, error_payload(str(error), '消息格式无效'))
+                continue
+            except Exception as error:
+                code = getattr(error, 'code', 'rate_limited')
+                await runtime.hub.send(connection.id, error_payload(code, str(error), retry_after=getattr(error, 'retry_after', None)))
                 continue
 
-            if message["type"] == "pixel_update":
-                # Process pixel update
-                event = PixelUpdateEvent(**message["data"])
-                log_id = None
-
-                # 更新redis并记录日志到数据库
-                async with deps.get_db_session() as db_session:
-                    canvas_service = CanvasService(canvas_store, db_session)
-                    log_id = await canvas_service.process_pixel_update(event)
-                    stats_data = await stats_service.handle_pixel_placed(1)
-                    await deps.increment_pixel_logs_counter()
-                    # 检查是否需要创建快照
-                    if await deps.async_should_create_snapshot():
-                        await deps.reset_pixel_logs_counter()
-                        # 使用后台任务创建快照，避免阻塞WebSocket消息处理
-                        asyncio.create_task(create_snapshot_background(log_id, canvas_store))
-                
-                # 发送更新并记录执行时间
-                start_time = time.time()
-                await manager.broadcast(json.dumps({"type": "pixel_update", "data": message["data"]}))
-                await manager.broadcast(json.dumps({"type": "visit_stats", "data": stats_data}))
-                elapsed_time = time.time() - start_time
-                logger.info(f"Broadcast message took {elapsed_time:.4f} seconds")
-                
+            if message.type == 'pixel.place':
+                await _place_pixel(runtime, connection, visitor_id, visit_id, client_ip, message)
+            elif message.type == 'challenge.verify':
+                await _verify_challenge(runtime, connection, visitor_id, client_ip, message)
+            else:
+                await runtime.hub.send(connection.id, error_payload('unsupported_type', '不支持的消息类型', request_id=message.request_id))
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        pass
+    except Exception:
+        if connection is not None:
+            await runtime.hub.send(connection.id, error_payload('internal_error', '连接处理失败，请重连'))
     finally:
-        # Keep in-memory connection state and online counter in sync.
-        manager.disconnect(connection_id=connection_id)
-        await manager.broadcast(json.dumps({"type": "visit_stats", "data": await stats_service.handle_disconnect()}))
-        # Close Redis connection (returns it to the pool)
-        await redis.close()
+        if connection is not None:
+            await runtime.hub.close(connection.id)
+            runtime.abuse.forget_connection(connection.id)
+        if visit_id is not None:
+            async with runtime.session_factory() as session:
+                async with session.begin():
+                    await repositories.close_visit(session, visit_id)
+        if online_opened:
+            stats = await runtime.stats.connection_closed()
+            try:
+                runtime.dispatcher.publish_nowait(ConnectionClosed(stats.as_dict()))
+            except Exception:
+                pass
+
+
+async def _place_pixel(
+    runtime: ApplicationRuntime,
+    connection: RealtimeConnection,
+    visitor_id: str,
+    visit_id: int,
+    client_ip: str,
+    message: IncomingMessage,
+) -> None:
+    if not message.request_id:
+        await runtime.hub.send(connection.id, error_payload('invalid_request_id', 'pixel.place 必须包含 request_id'))
+        return
+    try:
+        data = PixelPlaceData.model_validate(message.data)
+        x, y, color = data.x, data.y, data.color
+    except ValidationError:
+        await runtime.hub.send(connection.id, error_payload('invalid_pixel', '像素数据无效', request_id=message.request_id))
+        return
+    try:
+        applied = await runtime.canvas.place(PixelCommand(message.request_id, x, y, color, visitor_id, visit_id, client_ip))
+    except CanvasRejected as error:
+        await runtime.hub.send(connection.id, error_payload(error.code, error.message, request_id=message.request_id, retry_after=error.retry_after))
+        if error.code == 'challenge_required':
+            challenge = runtime.issue_challenge(visitor_id, client_ip)
+            await runtime.hub.send(connection.id, {'type': 'challenge.required', 'data': {'challenge_id': challenge.id, 'provider': challenge.provider, 'app_id': challenge.app_id}})
+        return
+    await runtime.hub.send(connection.id, {
+        'type': 'pixel.ack',
+        'request_id': message.request_id,
+        'data': {'event_id': applied.event_id, 'duplicate': applied.duplicate},
+    })
+
+
+async def _verify_challenge(
+    runtime: ApplicationRuntime,
+    connection: RealtimeConnection,
+    visitor_id: str,
+    client_ip: str,
+    message: IncomingMessage,
+) -> None:
+    try:
+        data = ChallengeVerifyData.model_validate(message.data)
+    except ValidationError:
+        await runtime.hub.send(connection.id, error_payload('invalid_challenge', '验证码数据无效', request_id=message.request_id))
+        return
+    challenge_id = data.challenge_id
+    if not runtime.consume_challenge(challenge_id, visitor_id, client_ip):
+        await runtime.hub.send(connection.id, error_payload('invalid_challenge', '验证码已失效', request_id=message.request_id))
+        return
+    result = await runtime.challenge_provider.verify(data.ticket, data.randstr, client_ip)
+    runtime.abuse.set_challenge_degraded(result is None)
+    await runtime.abuse.verify_challenge(visitor_id, result)
+    await runtime.hub.send(connection.id, {'type': 'challenge.result', 'request_id': message.request_id, 'data': {'success': result is True, 'degraded': result is None}})

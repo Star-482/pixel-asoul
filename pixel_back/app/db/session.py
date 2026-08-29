@@ -1,11 +1,22 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-from app.config import DATABASE_URL
+from __future__ import annotations
 
-# Create async engine
-engine = create_async_engine(DATABASE_URL, echo=True, future=True)
+from typing import TypeAlias
 
-# Create async session
-async_session = sessionmaker(
-    engine, class_=AsyncSession, expire_on_commit=False
-)
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+
+
+AsyncSessionFactory: TypeAlias = async_sessionmaker[AsyncSession]
+
+
+def create_database(
+    database_url: str,
+    *,
+    sql_echo: bool = False,
+) -> tuple[AsyncEngine, AsyncSessionFactory]:
+    engine = create_async_engine(
+        database_url,
+        echo=sql_echo,
+        pool_pre_ping=True,
+        future=True,
+    )
+    return engine, async_sessionmaker(engine, expire_on_commit=False)
