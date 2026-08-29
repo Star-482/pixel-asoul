@@ -28,6 +28,8 @@ class AdminApplication:
                 state = await repositories.get_moderation_state(session, visitor_id)
                 state.blocked_until = None
                 state.challenge_required_until = None
+                state.post_verification_watch_until = None
+                state.verified_until = None
                 await repositories.add_admin_action(session, admin_id=admin_id, action='moderation.unblock', details={'visitor_id': visitor_id})
 
     async def set_read_only(self, admin_id: str, enabled: bool) -> None:

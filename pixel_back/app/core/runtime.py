@@ -4,6 +4,7 @@ from time import monotonic
 from sqlalchemy import text
 
 from app.admin.auth import AdminAuth
+from app.admin.previews import AdminPreviewCache
 from app.admin.service import AdminApplication
 from app.abuse.challenge import Challenge, ChallengeProvider
 from app.abuse.identity import VisitorIdentity
@@ -67,6 +68,7 @@ class ApplicationRuntime:
             secure=settings.app_env == 'production',
         )
         self.admin = AdminApplication(self)
+        self.admin_previews = AdminPreviewCache(self.snapshot_store)
         # Imported here to keep the composition root as the only dependency
         # assembly location and avoid a moderation -> core import cycle.
         from app.moderation.service import ModerationApplication

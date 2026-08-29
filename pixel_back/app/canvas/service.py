@@ -41,13 +41,22 @@ class CanvasApplication:
         self._health = health
         self._configured_read_only = read_only
         self._admin_read_only = False
+        self._maintenance_read_only = False
 
     @property
     def read_only(self) -> bool:
-        return self._configured_read_only or self._admin_read_only or self._health.draining
+        return (
+            self._configured_read_only
+            or self._admin_read_only
+            or self._maintenance_read_only
+            or self._health.draining
+        )
 
     def set_read_only(self, enabled: bool) -> None:
         self._admin_read_only = enabled
+
+    def set_maintenance_read_only(self, enabled: bool) -> None:
+        self._maintenance_read_only = enabled
 
     async def place(self, command: PixelCommand) -> AppliedPixel:
         try:
@@ -60,6 +69,10 @@ class CanvasApplication:
             raise CanvasRejected('invalid_request', 'request_id is required')
 
         async with self.state.write_lock:
+            # A maintenance operation can start while a command is waiting for
+            # this lock. Check again so the queued command cannot slip through.
+            if self.read_only:
+                raise CanvasRejected('canvas_read_only', '当前仅允许浏览，暂不支持绘制')
             try:
                 previous_color = self.state.get_pixel(command.x, command.y)
             except ValueError as error:

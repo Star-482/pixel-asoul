@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Mapping, Sequence
 import json
 
-from sqlalchemy import Select, func, select, update
+from sqlalchemy import Select, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -69,6 +69,39 @@ async def create_pixel_log(
     return row
 
 
+async def create_restore_pixel_logs_bulk(
+    session: AsyncSession,
+    *,
+    operation_id: str,
+    changes: Sequence[tuple[int, int, str, str]],
+    chunk_size: int = 1000,
+) -> list[tuple[int, int, str, int]]:
+    """Append restore events efficiently while preserving per-pixel history."""
+    updates: list[tuple[int, int, str, int]] = []
+    statement = insert(PixelLog).returning(PixelLog.id, PixelLog.x, PixelLog.y, PixelLog.color)
+    for start in range(0, len(changes), chunk_size):
+        payload = [
+            {
+                'request_id': None,
+                'visitor_id': None,
+                'visit_id': None,
+                'x': x,
+                'y': y,
+                'color': color,
+                'previous_color': previous_color,
+                'source': 'admin_timeline_restore',
+                'restore_operation_id': operation_id,
+            }
+            for x, y, color, previous_color in changes[start:start + chunk_size]
+        ]
+        rows = await session.execute(statement, payload)
+        updates.extend(
+            (int(row.x), int(row.y), str(row.color), int(row.id))
+            for row in rows
+        )
+    return updates
+
+
 async def increment_placed_pixels(session: AsyncSession, amount: int = 1) -> int:
     counters = await get_or_create_counters(session)
     counters.total_placed_pixels += amount
@@ -116,8 +149,23 @@ async def get_counters(session: AsyncSession) -> SiteCounter:
 async def list_moderation_states(session: AsyncSession, limit: int = 100) -> list[ModerationState]:
     rows = await session.scalars(
         select(ModerationState)
-        .where(ModerationState.blocked_until.is_not(None) | ModerationState.challenge_required_until.is_not(None))
         .order_by(ModerationState.updated_at.desc())
+        .limit(limit)
+    )
+    return list(rows.all())
+
+
+async def list_snapshot_markers(
+    session: AsyncSession, *, start: datetime, end: datetime, limit: int = 500
+) -> list[CanvasSnapshot]:
+    rows = await session.scalars(
+        select(CanvasSnapshot)
+        .where(
+            CanvasSnapshot.status == 'valid',
+            CanvasSnapshot.created_at >= start,
+            CanvasSnapshot.created_at <= end,
+        )
+        .order_by(CanvasSnapshot.created_at.asc())
         .limit(limit)
     )
     return list(rows.all())
@@ -242,6 +290,7 @@ async def create_restore_operation(
     plan_id: str,
     created_by: str,
     affected_pixels: int,
+    skipped_pixels: int = 0,
     status: str = 'completed',
 ) -> RestoreOperation:
     row = RestoreOperation(
@@ -249,12 +298,33 @@ async def create_restore_operation(
         plan_id=plan_id,
         created_by=created_by,
         affected_pixels=affected_pixels,
+        skipped_pixels=skipped_pixels,
         status=status,
         completed_at=utc_now() if status == 'completed' else None,
     )
     session.add(row)
     await session.flush()
     return row
+
+
+async def finish_restore_operation(
+    session: AsyncSession,
+    *,
+    operation_id: str,
+    status: str,
+    affected_pixels: int,
+    skipped_pixels: int,
+) -> None:
+    await session.execute(
+        update(RestoreOperation)
+        .where(RestoreOperation.id == operation_id)
+        .values(
+            status=status,
+            affected_pixels=affected_pixels,
+            skipped_pixels=skipped_pixels,
+            completed_at=utc_now() if status in {'completed', 'failed'} else None,
+        )
+    )
 
 
 async def add_admin_action(
@@ -300,6 +370,37 @@ async def list_pixels_between(
     if visit_id is not None:
         statement = statement.where(PixelLog.visit_id == visit_id)
     return list((await session.scalars(statement.order_by(PixelLog.id))).all())
+
+
+async def list_latest_pixel_ids_in_bounds(
+    session: AsyncSession,
+    *,
+    x_min: int,
+    x_max: int,
+    y_min: int,
+    y_max: int,
+) -> set[int]:
+    """Return the current final log ID at each coordinate in an admin region.
+
+    The window query avoids issuing a ``SELECT`` per candidate coordinate when
+    an administrator previews a large selective rollback.
+    """
+    rank = func.row_number().over(
+        partition_by=(PixelLog.x, PixelLog.y),
+        order_by=PixelLog.id.desc(),
+    ).label('coordinate_rank')
+    ranked = (
+        select(PixelLog.id.label('id'), rank)
+        .where(
+            PixelLog.x >= x_min,
+            PixelLog.x <= x_max,
+            PixelLog.y >= y_min,
+            PixelLog.y <= y_max,
+        )
+        .subquery()
+    )
+    values = await session.scalars(select(ranked.c.id).where(ranked.c.coordinate_rank == 1))
+    return {int(value) for value in values}
 
 
 async def list_recent_visitor_pixels(
