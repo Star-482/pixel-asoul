@@ -29,6 +29,7 @@ class DrawReservation:
     overwrite_cost: int
     risk: PlacementRisk
     observe_only: bool
+    is_recent_self_edit: bool
 
 
 class AbuseGuard:
@@ -58,9 +59,16 @@ class AbuseGuard:
         bucket.confirm()
 
     async def reserve_draw(
-        self, visitor_id: str, client_ip: str, previous_color: str, new_color: str
+        self,
+        visitor_id: str,
+        client_ip: str,
+        previous_color: str,
+        new_color: str,
+        *,
+        is_recent_self_edit: bool = False,
     ) -> DrawReservation:
         risk = self._risk_windows.setdefault(visitor_id, RiskWindow()).assess(previous_color, new_color)
+        destructive_overwrite = bool(risk.overwrite_cost and not is_recent_self_edit)
         identities = self._ip_identities.setdefault(client_ip, {})
         cutoff = monotonic() - 3600
         for known_id, seen_at in tuple(identities.items()):
@@ -74,12 +82,16 @@ class AbuseGuard:
                 now = utc_now()
                 if state.blocked_until and state.blocked_until > now:
                     raise AbuseRejected('drawing_blocked', '当前访客暂时无法绘制', int((state.blocked_until - now).total_seconds()))
-                if state.challenge_required_until and state.challenge_required_until > now and risk.overwrite_cost:
+                if (
+                    state.challenge_required_until
+                    and state.challenge_required_until > now
+                    and destructive_overwrite
+                ):
                     if self._challenge_degraded:
                         degraded_overwrite = True
                     else:
                         raise AbuseRejected('challenge_required', '请先完成验证码后再覆盖他人像素')
-                if len(identities) > 5 and risk.overwrite_cost:
+                if len(identities) > 5 and destructive_overwrite:
                     state.challenge_required_until = now + timedelta(hours=1)
                     await session.commit()
                     raise AbuseRejected('challenge_required', '该网络需要先完成验证码后再覆盖他人像素')
@@ -93,7 +105,9 @@ class AbuseGuard:
             TokenBucket(self.settings.ip_bucket_capacity, self.settings.ip_bucket_refill_per_second),
         )
         overwrite_bucket: TokenBucket | None = None
-        overwrite_cost = 1 if degraded_overwrite else risk.overwrite_cost
+        overwrite_cost = (
+            1 if degraded_overwrite else risk.overwrite_cost if destructive_overwrite else 0
+        )
         if overwrite_cost:
             overwrite_bucket = self._overwrite_buckets.setdefault(
                 f'{visitor_id}:degraded' if degraded_overwrite else visitor_id,
@@ -105,7 +119,16 @@ class AbuseGuard:
 
         if self.settings.abuse_mode == 'observe':
             # Keep calculating the real decision while intentionally letting it pass.
-            return DrawReservation(visitor_id, None, None, None, overwrite_cost, risk, True)
+            return DrawReservation(
+                visitor_id=visitor_id,
+                visitor_bucket=None,
+                ip_bucket=None,
+                overwrite_bucket=None,
+                overwrite_cost=overwrite_cost,
+                risk=risk,
+                observe_only=True,
+                is_recent_self_edit=is_recent_self_edit,
+            )
 
         if not visitor_bucket.reserve():
             raise AbuseRejected('rate_limited', '绘制速度过快', visitor_bucket.retry_after())
@@ -117,7 +140,16 @@ class AbuseGuard:
             ip_bucket.refund()
             await self._record_overwrite_exhaustion(visitor_id)
             raise AbuseRejected('destructive_cooldown', '覆盖操作过于频繁', overwrite_bucket.retry_after(overwrite_cost))
-        return DrawReservation(visitor_id, visitor_bucket, ip_bucket, overwrite_bucket, overwrite_cost, risk, False)
+        return DrawReservation(
+            visitor_id=visitor_id,
+            visitor_bucket=visitor_bucket,
+            ip_bucket=ip_bucket,
+            overwrite_bucket=overwrite_bucket,
+            overwrite_cost=overwrite_cost,
+            risk=risk,
+            observe_only=False,
+            is_recent_self_edit=is_recent_self_edit,
+        )
 
     async def commit(self, reservation: DrawReservation, previous_color: str, new_color: str) -> None:
         if not reservation.observe_only:
@@ -126,7 +158,10 @@ class AbuseGuard:
             reservation.ip_bucket.confirm()
             if reservation.overwrite_bucket is not None:
                 reservation.overwrite_bucket.confirm(reservation.overwrite_cost)
-        self._risk_windows.setdefault(reservation.visitor_id, RiskWindow()).record(previous_color, new_color)
+        if not reservation.is_recent_self_edit:
+            self._risk_windows.setdefault(reservation.visitor_id, RiskWindow()).record(
+                previous_color, new_color
+            )
 
     def refund(self, reservation: DrawReservation) -> None:
         if reservation.observe_only:

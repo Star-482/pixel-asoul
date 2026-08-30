@@ -97,10 +97,14 @@ class SnapshotStore:
             temporary.unlink(missing_ok=True)
             raise
 
-    def write_preview(self, array: NDArray[np.uint8], preview_id: str) -> str:
+    def write_preview(self, array: NDArray[np.uint8], preview_id: str, suffix: str = '') -> str:
         if Path(preview_id).name != preview_id or not preview_id:
             raise SnapshotError('unsafe preview id')
-        filename = f'preview-{preview_id}.png'
+        if suffix not in ('', '-diff'):
+            raise SnapshotError('unsafe preview suffix')
+        if array.shape != (self.height, self.width, 3):
+            raise SnapshotError('attempted to write a preview with invalid dimensions')
+        filename = f'preview-{preview_id}{suffix}.png'
         destination = self.path_for(filename)
         temporary = destination.with_suffix('.tmp')
         try:

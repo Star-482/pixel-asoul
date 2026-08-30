@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 from app.abuse.service import AbuseGuard, AbuseRejected
 from app.canvas.model import AppliedPixel, PixelCommand, WHITE, normalize_color
 from app.canvas.state import CanvasState
 from app.core.events import OrderedEventDispatcher, PixelCommitted
 from app.core.health import HealthState
 from app.db import repositories
+from app.db.models import utc_now
 from app.db.session import AsyncSessionFactory
 
 
@@ -33,6 +36,7 @@ class CanvasApplication:
         health: HealthState,
         *,
         read_only: bool,
+        self_edit_grace_seconds: int,
     ) -> None:
         self.state = state
         self._session_factory = session_factory
@@ -40,6 +44,7 @@ class CanvasApplication:
         self._abuse = abuse
         self._health = health
         self._configured_read_only = read_only
+        self._self_edit_grace_seconds = self_edit_grace_seconds
         self._admin_read_only = False
         self._maintenance_read_only = False
 
@@ -95,9 +100,27 @@ class CanvasApplication:
             if previous_color == color:
                 raise CanvasRejected('same_color', '该像素已经是该颜色')
 
+            is_recent_self_edit = False
+            if previous_color != WHITE:
+                async with self._session_factory() as session:
+                    latest = await repositories.get_latest_pixel_at(
+                        session, x=command.x, y=command.y
+                    )
+                is_recent_self_edit = bool(
+                    latest is not None
+                    and latest.visitor_id == command.visitor_id
+                    and latest.source in {'user', 'user_self_edit'}
+                    and latest.created_at
+                    >= utc_now() - timedelta(seconds=self._self_edit_grace_seconds)
+                )
+
             try:
                 reservation = await self._abuse.reserve_draw(
-                    command.visitor_id, command.client_ip, previous_color, color
+                    command.visitor_id,
+                    command.client_ip,
+                    previous_color,
+                    color,
+                    is_recent_self_edit=is_recent_self_edit,
                 )
             except AbuseRejected as error:
                 raise CanvasRejected(error.code, error.message, error.retry_after) from error
@@ -123,6 +146,7 @@ class CanvasApplication:
                             y=command.y,
                             color=color,
                             previous_color=previous_color,
+                            source='user_self_edit' if is_recent_self_edit else 'user',
                         )
                         total = await repositories.increment_placed_pixels(session)
             except Exception:

@@ -15,17 +15,21 @@ const image = ref(null);
 const dragging = ref(false);
 const dragStart = ref(null);
 const confirmationText = ref('');
+const showDifference = ref(true);
 const form = reactive({
   target_event_id: '', target_time: '', mode: 'selective', event_to_id: '',
   visitor_id: '', connection_id: '', x_min: 0, y_min: 0, x_max: 999, y_max: 999,
 });
 
-watch(() => props.canvas, canvas => {
-  if (!canvas) return;
-  form.x_max = canvas.width - 1;
-  form.y_max = canvas.height - 1;
-  if (!form.event_to_id) form.event_to_id = canvas.head_event_id;
-}, { immediate: true, deep: true });
+watch(() => [props.canvas?.width, props.canvas?.height], ([width, height]) => {
+  if (!width || !height) return;
+  const dimensionsChanged = Number(form.x_max) >= width || Number(form.y_max) >= height;
+  if (dimensionsChanged || (Number(form.x_max) === 999 && Number(form.y_max) === 999)) {
+    form.x_max = width - 1;
+    form.y_max = height - 1;
+  }
+  if (!form.event_to_id) form.event_to_id = props.canvas.head_event_id;
+}, { immediate: true });
 
 watch(() => props.selectedTime, time => {
   if (!time) return;
@@ -148,10 +152,12 @@ defineExpose({ setTargetTime });
     <div v-if="preview" class="preview-summary">
       <span>事件 {{ preview.target_event_id }} / 当前 {{ preview.head_event_id }}</span>
       <strong>与当前画布相差 {{ preview.difference_pixels.toLocaleString() }} 像素</strong>
+      <label v-if="preview.difference_url" class="difference-toggle"><input v-model="showDifference" type="checkbox" /> 高亮差异</label>
       <span>预览十分钟后失效</span>
     </div>
     <div v-if="preview" class="preview-stage" @pointerdown="beginSelection" @pointermove="moveSelection" @pointerup="endSelection" @pointercancel="endSelection">
       <img ref="image" :src="preview.url" alt="历史画布预览；拖动以选择恢复区域" draggable="false" />
+      <img v-if="showDifference && preview.difference_url" class="difference-overlay" :src="preview.difference_url" alt="红色区域表示与当前画布不同的像素" draggable="false" />
       <div class="selection" :style="selectionStyle"></div>
     </div>
     <p v-else class="empty-preview">选择时间点后生成预览；在预览图上拖动即可框选恢复区域。</p>
@@ -173,6 +179,7 @@ defineExpose({ setTargetTime });
     <div v-if="plan" class="plan-box">
       <strong>恢复计划已生成：{{ plan.affected_pixels.toLocaleString() }} 个像素</strong>
       <span>计划会在 {{ new Date(plan.expires_at).toLocaleTimeString('zh-CN') }} 失效；画布变化后须重新生成。</span>
+      <span v-if="form.mode === 'exact'">此恢复将覆盖 {{ (plan.subsequent_changes ?? 0).toLocaleString() }} 条目标事件后的修改。</span>
       <label v-if="fullCanvas">整图精确恢复确认 <input v-model="confirmationText" placeholder="请输入：恢复整图" /></label>
       <button class="danger" :disabled="busy" @click="executePlan">执行恢复</button>
     </div>
@@ -184,6 +191,6 @@ defineExpose({ setTargetTime });
 </template>
 
 <style scoped>
-.card { background: #fff; border: 1px solid #dbe3ee; border-radius: 14px; padding: 22px; box-shadow: 0 4px 16px #1720330d; }.section-heading { display:flex; justify-content:space-between; gap:16px; }.section-heading h2 { margin:0; font-size:20px; }.section-heading p,.help,.empty-preview { color:#64748b; font-size:13px; line-height:1.55; }.loading { color:#2563eb; font-size:13px; }.target-row,.form-grid { display:grid; gap:10px; margin-top:16px; }.target-row { grid-template-columns:repeat(3,minmax(0,1fr)); align-items:end; }.form-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }.target-row label,.form-grid label,.plan-box label { display:grid; gap:5px; color:#475569; font-size:12px; }input,select,button { font:inherit; box-sizing:border-box; min-width:0; }input,select { padding:8px; border:1px solid #cbd5e1; border-radius:7px; }button { background:#2563eb; color:#fff; border:1px solid #2563eb; border-radius:7px; padding:9px 12px; cursor:pointer; }button:disabled { opacity:.55; cursor:not-allowed; }.preview-summary { display:flex; flex-wrap:wrap; gap:12px; margin-top:16px; padding:9px 11px; background:#eff6ff; border-radius:8px; color:#1e3a8a; font-size:12px; }.preview-stage { position:relative; width:min(100%,700px); margin:14px 0; border:1px solid #cbd5e1; line-height:0; touch-action:none; cursor:crosshair; }.preview-stage img { display:block; width:100%; image-rendering:pixelated; user-select:none; }.selection { position:absolute; border:2px solid #ef4444; background:#ef444424; pointer-events:none; box-sizing:border-box; }.warning { color:#b45309; }.plan-box,.operation-box { display:grid; gap:10px; margin-top:16px; padding:14px; border:1px solid #fdba74; background:#fff7ed; border-radius:9px; color:#9a3412; }.plan-box span,.operation-box span { font-size:12px; }.operation-box { border-color:#93c5fd; background:#eff6ff; color:#1e3a8a; }.danger { background:#b91c1c; border-color:#b91c1c; width:max-content; }.help { margin:10px 0; }
+.card { background: #fff; border: 1px solid #dbe3ee; border-radius: 14px; padding: 22px; box-shadow: 0 4px 16px #1720330d; }.section-heading { display:flex; justify-content:space-between; gap:16px; }.section-heading h2 { margin:0; font-size:20px; }.section-heading p,.help,.empty-preview { color:#64748b; font-size:13px; line-height:1.55; }.loading { color:#2563eb; font-size:13px; }.target-row,.form-grid { display:grid; gap:10px; margin-top:16px; }.target-row { grid-template-columns:repeat(3,minmax(0,1fr)); align-items:end; }.form-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }.target-row label,.form-grid label,.plan-box label { display:grid; gap:5px; color:#475569; font-size:12px; }input,select,button { font:inherit; box-sizing:border-box; min-width:0; }input,select { padding:8px; border:1px solid #cbd5e1; border-radius:7px; }button { background:#2563eb; color:#fff; border:1px solid #2563eb; border-radius:7px; padding:9px 12px; cursor:pointer; }button:disabled { opacity:.55; cursor:not-allowed; }.preview-summary { display:flex; flex-wrap:wrap; gap:12px; margin-top:16px; padding:9px 11px; background:#eff6ff; border-radius:8px; color:#1e3a8a; font-size:12px; }.difference-toggle { display:flex; gap:5px; align-items:center; cursor:pointer; }.difference-toggle input { padding:0; }.preview-stage { position:relative; width:min(100%,700px); margin:14px 0; border:1px solid #cbd5e1; line-height:0; touch-action:none; cursor:crosshair; }.preview-stage img { display:block; width:100%; image-rendering:pixelated; user-select:none; }.preview-stage .difference-overlay { position:absolute; inset:0; opacity:.52; mix-blend-mode:multiply; pointer-events:none; }.selection { position:absolute; border:2px solid #ef4444; background:#ef444424; pointer-events:none; box-sizing:border-box; }.warning { color:#b45309; }.plan-box,.operation-box { display:grid; gap:10px; margin-top:16px; padding:14px; border:1px solid #fdba74; background:#fff7ed; border-radius:9px; color:#9a3412; }.plan-box span,.operation-box span { font-size:12px; }.operation-box { border-color:#93c5fd; background:#eff6ff; color:#1e3a8a; }.danger { background:#b91c1c; border-color:#b91c1c; width:max-content; }.help { margin:10px 0; }
 @media (max-width:850px) { .target-row,.form-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } } @media (max-width:520px) { .card { padding:16px; }.target-row,.form-grid { grid-template-columns:1fr; } }
 </style>

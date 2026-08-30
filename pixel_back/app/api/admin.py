@@ -56,6 +56,7 @@ async def login(request: Request) -> JSONResponse:
     if not isinstance(token, str) or not runtime.admin_auth.verify_token(token):
         raise HTTPException(status_code=401, detail='管理员令牌无效')
     cookie, csrf = runtime.admin_auth.issue()
+    await runtime.admin.audit('administrator', 'admin.login')
     response = JSONResponse({'csrf_token': csrf, 'expires_in_minutes': runtime.settings.admin_session_minutes})
     response.set_cookie(
         runtime.admin_auth.COOKIE_NAME,
@@ -71,7 +72,8 @@ async def login(request: Request) -> JSONResponse:
 
 @router.delete('/session')
 async def logout(request: Request) -> Response:
-    _require(request, mutation=True)
+    principal = _require(request, mutation=True)
+    await _runtime(request).admin.audit(principal['sub'], 'admin.logout')
     response = Response(status_code=204)
     response.delete_cookie(_runtime(request).admin_auth.COOKIE_NAME, path='/api/v2/admin')
     return response
@@ -103,8 +105,8 @@ async def timeline(request: Request, start: str | None = None, end: str | None =
     now = datetime.now(timezone.utc)
     start_time = _parse_datetime(start, 'start') if start else now - timedelta(days=1)
     end_time = _parse_datetime(end, 'end') if end else now
-    if start_time > end_time:
-        raise HTTPException(status_code=422, detail='start 不能晚于 end')
+    if start_time >= end_time:
+        raise HTTPException(status_code=422, detail='start 必须早于 end')
     runtime = _runtime(request)
     async with runtime.session_factory() as session:
         snapshots = await repositories.list_snapshot_markers(
@@ -119,9 +121,10 @@ async def timeline(request: Request, start: str | None = None, end: str | None =
             {
                 'id': snapshot.id,
                 'event_id': snapshot.last_log_id,
+                'event_time': event_time,
                 'created_at': snapshot.created_at,
             }
-            for snapshot in snapshots
+            for snapshot, event_time in snapshots
         ],
         'timezone': 'Asia/Shanghai',
     }
@@ -149,13 +152,24 @@ async def create_preview(request: Request) -> dict:
         raise HTTPException(status_code=422, detail='目标事件不在有效范围')
     array = await build_historical_array(event_id=target_event_id, state=runtime.canvas_state, session_factory=runtime.session_factory, snapshot_store=runtime.snapshot_store)
     preview_id = str(uuid4())
+    difference_mask = np.any(array != current, axis=2)
+    difference = np.full_like(array, 255)
+    difference[difference_mask] = (239, 68, 68)
     filename = await asyncio.to_thread(runtime.snapshot_store.write_preview, array, preview_id)
+    try:
+        difference_filename = await asyncio.to_thread(
+            runtime.snapshot_store.write_preview, difference, preview_id, '-diff'
+        )
+    except Exception:
+        runtime.snapshot_store.path_for(filename).unlink(missing_ok=True)
+        raise
     item = runtime.admin_previews.add(
         preview_id=preview_id,
         filename=filename,
+        difference_filename=difference_filename,
         target_event_id=target_event_id,
         head_event_id=head_event_id,
-        difference_pixels=int(np.count_nonzero(np.any(array != current, axis=2))),
+        difference_pixels=int(np.count_nonzero(difference_mask)),
     )
     return {
         'id': item.id,
@@ -163,6 +177,7 @@ async def create_preview(request: Request) -> dict:
         'head_event_id': item.head_event_id,
         'difference_pixels': item.difference_pixels,
         'url': f'/api/v2/admin/timeline/previews/{item.id}.png',
+        'difference_url': f'/api/v2/admin/timeline/previews/{item.id}/diff.png',
         'expires_in_seconds': 600,
     }
 
@@ -177,6 +192,21 @@ async def get_preview(preview_id: str, request: Request) -> FileResponse:
     if preview is None:
         raise HTTPException(status_code=404, detail='预览已过期，请重新生成')
     path = runtime.snapshot_store.path_for(preview.filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail='预览不存在')
+    return FileResponse(path, media_type='image/png', headers={'Cache-Control': 'private, max-age=600'})
+
+
+@router.get('/timeline/previews/{preview_id}/diff.png')
+async def get_preview_difference(preview_id: str, request: Request) -> FileResponse:
+    _require(request)
+    if len(preview_id) != 36:
+        raise HTTPException(status_code=404, detail='预览不存在')
+    runtime = _runtime(request)
+    preview = runtime.admin_previews.get(preview_id)
+    if preview is None:
+        raise HTTPException(status_code=404, detail='预览已过期，请重新生成')
+    path = runtime.snapshot_store.path_for(preview.difference_filename)
     if not path.is_file():
         raise HTTPException(status_code=404, detail='预览不存在')
     return FileResponse(path, media_type='image/png', headers={'Cache-Control': 'private, max-age=600'})

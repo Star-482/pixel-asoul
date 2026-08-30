@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from time import monotonic
+from time import monotonic, time
 
 from app.snapshots.store import SnapshotStore
 
@@ -10,6 +10,7 @@ from app.snapshots.store import SnapshotStore
 class AdminPreview:
     id: str
     filename: str
+    difference_filename: str
     target_event_id: int
     head_event_id: int
     difference_pixels: int
@@ -29,6 +30,7 @@ class AdminPreviewCache:
         *,
         preview_id: str,
         filename: str,
+        difference_filename: str,
         target_event_id: int,
         head_event_id: int,
         difference_pixels: int,
@@ -37,6 +39,7 @@ class AdminPreviewCache:
         item = AdminPreview(
             id=preview_id,
             filename=filename,
+            difference_filename=difference_filename,
             target_event_id=target_event_id,
             head_event_id=head_event_id,
             difference_pixels=difference_pixels,
@@ -56,8 +59,22 @@ class AdminPreviewCache:
                 continue
             self._items.pop(preview_id, None)
             try:
-                self._store.path_for(item.filename).unlink(missing_ok=True)
+                self._remove_files(item.filename, item.difference_filename)
             except Exception:
                 # A stale preview is never allowed to make the administrative
                 # API unavailable. The next filesystem cleanup can remove it.
                 continue
+        # Preview metadata is intentionally process-local. Remove files left by
+        # a restart after their ten-minute retention period without touching
+        # ordinary canvas snapshots.
+        cutoff = time() - self._ttl_seconds
+        for path in self._store.directory.glob('preview-*.png'):
+            try:
+                if path.stat().st_mtime <= cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    def _remove_files(self, *filenames: str) -> None:
+        for filename in filenames:
+            self._store.path_for(filename).unlink(missing_ok=True)

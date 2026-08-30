@@ -53,6 +53,12 @@ class ModerationApplication:
         self._runtime = runtime
         self._background_tasks: set[asyncio.Task[None]] = set()
 
+    async def stop(self) -> None:
+        """Let accepted maintenance restores finish before the runtime exits."""
+        tasks = tuple(self._background_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def make_restore_plan(self, admin_id: str, payload: dict[str, object]) -> dict[str, object]:
         mode_value = payload.get('mode', 'selective')
         mode = mode_value if isinstance(mode_value, str) else ''
@@ -67,6 +73,18 @@ class ModerationApplication:
             if mode == 'selective' and filters['event_to_id'] < target_event_id:
                 raise ModerationError('invalid_range', '撤销范围结束事件不能早于起始事件')
             coordinates = await self._plan_coordinates(mode, target_event_id, head, filters)
+            subsequent_changes = 0
+            if mode == 'exact':
+                async with self._runtime.session_factory() as session:
+                    subsequent_changes = await repositories.count_pixels_between(
+                        session,
+                        after_id=target_event_id,
+                        through_id=head,
+                        x_min=filters['x_min'],
+                        x_max=filters['x_max'],
+                        y_min=filters['y_min'],
+                        y_max=filters['y_max'],
+                    )
             plan_id = str(uuid4())
             filters['coordinates'] = coordinates
             expires_at = utc_now() + timedelta(minutes=10)
@@ -87,6 +105,7 @@ class ModerationApplication:
                 'id': plan_id,
                 'head_event_id': head,
                 'affected_pixels': len(coordinates),
+                'subsequent_changes': subsequent_changes,
                 'requires_background': len(coordinates) > INTERACTIVE_RESTORE_LIMIT,
                 'expires_at': expires_at.isoformat(),
             }
@@ -210,6 +229,13 @@ class ModerationApplication:
                             raise ModerationError('not_found', '恢复计划不存在或已取消')
                         if plan.head_event_id != self._runtime.canvas_state.head_event_id:
                             raise ModerationError('preview_stale', '维护开始前画布已变化，请重新预览')
+                        await repositories.finish_restore_operation(
+                            session,
+                            operation_id=operation_id,
+                            status='running',
+                            affected_pixels=0,
+                            skipped_pixels=0,
+                        )
                         changes = self._collect_changes(raw_coordinates)
                         updates = await repositories.create_restore_pixel_logs_bulk(
                             session,

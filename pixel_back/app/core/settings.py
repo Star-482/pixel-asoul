@@ -76,6 +76,7 @@ class Settings:
     ip_bucket_refill_per_second: float
     overwrite_bucket_capacity: float
     overwrite_refill_seconds: float
+    self_edit_grace_seconds: int
     verified_risk_window_minutes: int
     verified_risk_block_minutes: int
     tencent_secret_id: str
@@ -160,6 +161,7 @@ class Settings:
                 "OVERWRITE_BUCKET_CAPACITY", 20.0, 1.0
             ),
             overwrite_refill_seconds=_float("OVERWRITE_REFILL_SECONDS", 15.0, 0.1),
+            self_edit_grace_seconds=_int("SELF_EDIT_GRACE_SECONDS", 3600, 1),
             verified_risk_window_minutes=_int(
                 "VERIFIED_RISK_WINDOW_MINUTES", 10, 1
             ),

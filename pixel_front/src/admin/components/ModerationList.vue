@@ -10,7 +10,9 @@ const emit = defineEmits(['block', 'unblock']);
 const manualVisitorId = ref('');
 const manualMinutes = ref(30);
 
-const activeItems = computed(() => props.items.filter(item => item.status !== 'normal'));
+const relevantItems = computed(() => props.items.filter(item => (
+  item.status !== 'normal' || Number(item.strike_count) > 0 || Number(item.challenge_failures) > 0
+)));
 
 function formatTime(value) {
   if (!value) return '—';
@@ -49,15 +51,15 @@ async function copyVisitorId(visitorId) {
       <table>
         <thead><tr><th>访客</th><th>状态</th><th>封禁至</th><th>验证码 / 观察</th><th>记录</th><th>操作</th></tr></thead>
         <tbody>
-          <tr v-for="row in activeItems" :key="row.visitor_id">
+          <tr v-for="row in relevantItems" :key="row.visitor_id">
             <td><button class="visitor" :title="row.visitor_id" @click="copyVisitorId(row.visitor_id)">{{ row.display_visitor_id }}</button></td>
-            <td><span class="status" :class="row.status">{{ row.status === 'blocked' ? '已封禁' : row.status === 'challenge_required' ? '待验证' : '观察中' }}</span></td>
+            <td><span class="status" :class="row.status">{{ row.status === 'blocked' ? '已封禁' : row.status === 'challenge_required' ? '待验证' : row.status === 'observing' ? '观察中' : '正常（有历史）' }}</span></td>
             <td>{{ formatTime(row.blocked_until) }}</td>
             <td>{{ formatTime(row.challenge_required_until || row.post_verification_watch_until) }}</td>
             <td>{{ row.strike_count }} 次处罚 / {{ row.challenge_failures }} 次失败</td>
             <td class="actions"><button v-if="row.status === 'blocked'" class="secondary" :disabled="busy" @click="emit('unblock', row.visitor_id)">解除</button><button v-else class="secondary" :disabled="busy" @click="requestBlock(row.visitor_id)">封禁</button></td>
           </tr>
-          <tr v-if="!activeItems.length"><td colspan="6" class="empty">当前没有活跃的风控或封禁记录。</td></tr>
+          <tr v-if="!relevantItems.length"><td colspan="6" class="empty">当前没有风控、验证码或封禁记录。</td></tr>
         </tbody>
       </table>
     </div>

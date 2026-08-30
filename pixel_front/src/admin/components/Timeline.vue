@@ -36,6 +36,41 @@ watch(() => [props.start, props.end], ([start, end]) => {
 const maxCount = computed(() => Math.max(1, ...props.buckets.map(bucket => Number(bucket.count) || 0)));
 const startMs = computed(() => new Date(props.start).getTime());
 const endMs = computed(() => new Date(props.end).getTime());
+const timeSpan = computed(() => Math.max(1, endMs.value - startMs.value));
+
+function timeRatio(time) {
+  return Math.min(1, Math.max(0, (time - startMs.value) / timeSpan.value));
+}
+
+watch(() => props.selectedTime, time => {
+  if (!time) return;
+  position.value = Math.round(timeRatio(new Date(time).getTime()) * 1000) / 10;
+});
+
+const snapshotMarkers = computed(() => {
+  const lanes = new Map();
+  return [...props.snapshots]
+    .map(snapshot => ({ ...snapshot, timeline_time: snapshot.event_time || snapshot.created_at }))
+    .filter(snapshot => Number.isFinite(new Date(snapshot.timeline_time).getTime()))
+    .sort((left, right) => new Date(left.timeline_time) - new Date(right.timeline_time) || Number(left.id) - Number(right.id))
+    .map(snapshot => {
+      const time = new Date(snapshot.timeline_time).getTime();
+      const bucket = props.buckets.find((item, index) => {
+        const bucketStart = new Date(item.start).getTime();
+        const bucketEnd = new Date(item.end).getTime();
+        return time >= bucketStart && (time < bucketEnd || (index === props.buckets.length - 1 && time <= bucketEnd));
+      });
+      const key = bucket?.start || `outside-${snapshot.timeline_time}`;
+      const lane = lanes.get(key) || 0;
+      lanes.set(key, lane + 1);
+      return { ...snapshot, lane };
+    });
+});
+
+const timelineStyle = computed(() => {
+  const largestLane = snapshotMarkers.value.reduce((largest, marker) => Math.max(largest, marker.lane), 0);
+  return { '--timeline-height': `${Math.max(152, 34 + (largestLane + 1) * 18)}px` };
+});
 
 function formatTime(value) {
   return new Intl.DateTimeFormat('zh-CN', {
@@ -46,7 +81,7 @@ function formatTime(value) {
 function emitRange() {
   const start = toIso(startInput.value);
   const end = toIso(endInput.value);
-  if (!start || !end || new Date(start) > new Date(end)) return;
+  if (!start || !end || new Date(start) >= new Date(end)) return;
   emit('change-range', { start, end });
 }
 
@@ -58,15 +93,35 @@ function selectAtRatio(rawRatio) {
 }
 
 function selectBucket(bucket) {
-  emit('select-time', bucket.time);
-  const span = Math.max(1, endMs.value - startMs.value);
-  position.value = Math.round(((new Date(bucket.time).getTime() - startMs.value) / span) * 1000) / 10;
+  selectAtRatio(timeRatio(new Date(bucket.start).getTime()));
+}
+
+function selectSnapshot(snapshot) {
+  selectAtRatio(timeRatio(new Date(snapshot.timeline_time).getTime()));
+}
+
+function bucketStyle(bucket) {
+  const left = timeRatio(new Date(bucket.start).getTime()) * 100;
+  const right = timeRatio(new Date(bucket.end).getTime()) * 100;
+  const count = Number(bucket.count) || 0;
+  return {
+    left: `${left}%`,
+    width: `${Math.max(0, right - left)}%`,
+    height: `${count ? Math.max(3, (count / maxCount.value) * 100) : 1}%`,
+  };
+}
+
+function markerStyle(snapshot) {
+  return {
+    left: `${timeRatio(new Date(snapshot.timeline_time).getTime()) * 100}%`,
+    bottom: `${4 + snapshot.lane * 18}px`,
+  };
 }
 
 function shift(minutes) {
   const selected = props.selectedTime ? new Date(props.selectedTime).getTime() : endMs.value;
   const time = Math.min(endMs.value, Math.max(startMs.value, selected + minutes * 60 * 1000));
-  selectAtRatio((time - startMs.value) / Math.max(1, endMs.value - startMs.value));
+  selectAtRatio((time - startMs.value) / timeSpan.value);
 }
 
 function togglePlayback() {
@@ -82,12 +137,6 @@ function togglePlayback() {
   }, 800);
 }
 
-function markerStyle(snapshot) {
-  const span = Math.max(1, endMs.value - startMs.value);
-  const left = ((new Date(snapshot.created_at).getTime() - startMs.value) / span) * 100;
-  return { left: `${Math.min(100, Math.max(0, left))}%` };
-}
-
 onBeforeUnmount(() => clearInterval(playbackTimer));
 </script>
 
@@ -96,7 +145,7 @@ onBeforeUnmount(() => clearInterval(playbackTimer));
     <div class="section-heading">
       <div>
         <h2>时间轴</h2>
-        <p>所有时间按 Asia/Shanghai 显示；拖动滑块会生成对应历史预览。</p>
+        <p>所有时间按 Asia/Shanghai 显示；柱状图、快照节点和滑块共用同一时间坐标。</p>
       </div>
       <span v-if="loading" class="loading">加载中…</span>
     </div>
@@ -108,22 +157,23 @@ onBeforeUnmount(() => clearInterval(playbackTimer));
     </div>
 
     <div class="timeline-shell">
-      <div class="timeline-bars" aria-label="修改密度时间轴">
+      <div class="timeline-bars" :style="timelineStyle" aria-label="修改密度时间轴">
         <button
           v-for="bucket in buckets"
-          :key="bucket.time"
+          :key="bucket.start"
           class="timeline-bar"
-          :title="`${formatTime(bucket.time)}：${bucket.count} 次修改`"
-          :style="{ height: `${Math.max(3, (Number(bucket.count) / maxCount) * 100)}%` }"
+          :class="{ empty: !Number(bucket.count) }"
+          :title="`${formatTime(bucket.start)} 至 ${formatTime(bucket.end)}：${bucket.count} 次修改`"
+          :style="bucketStyle(bucket)"
           @click="selectBucket(bucket)"
         ></button>
         <button
-          v-for="snapshot in snapshots"
+          v-for="snapshot in snapshotMarkers"
           :key="snapshot.id"
           class="snapshot-marker"
           :style="markerStyle(snapshot)"
-          :title="`快照 #${snapshot.id} · 事件 ${snapshot.event_id}`"
-          @click="emit('select-time', snapshot.created_at)"
+          :title="`快照 #${snapshot.id} · 事件 ${snapshot.event_id} · 画布时间 ${formatTime(snapshot.timeline_time)}`"
+          @click="selectSnapshot(snapshot)"
         >◆</button>
       </div>
       <div class="timeline-labels"><span>{{ formatTime(start) }}</span><span>{{ formatTime(end) }}</span></div>
@@ -144,6 +194,6 @@ onBeforeUnmount(() => clearInterval(playbackTimer));
 .section-heading { display: flex; justify-content: space-between; gap: 16px; align-items: start; }.section-heading h2 { margin: 0; font-size: 20px; }.section-heading p { margin: 6px 0 0; color: #64748b; font-size: 13px; }.loading { color: #2563eb; font-size: 13px; }
 .range-controls,.scrubber-row { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin-top: 18px; }.range-controls label { display: grid; gap: 5px; color: #475569; font-size: 12px; }.range-controls input { min-width: 185px; }
 input,button { font: inherit; }.secondary,.icon-button { background: #fff; color: #1e40af; border: 1px solid #bfdbfe; border-radius: 7px; padding: 8px 10px; cursor: pointer; }.icon-button { font-size: 20px; line-height: 18px; min-width: 34px; }
-.timeline-shell { margin-top: 18px; }.timeline-bars { position: relative; height: 152px; display: flex; align-items: end; gap: 2px; border: 1px solid #dbe3ee; border-radius: 9px 9px 0 0; overflow: hidden; padding: 10px 8px 0; background: linear-gradient(to bottom, #f8fbff, #fff); }.timeline-bar { min-width: 3px; flex: 1; border: 0; background: linear-gradient(#60a5fa, #2563eb); cursor: pointer; border-radius: 2px 2px 0 0; }.timeline-bar:hover { background: #1d4ed8; }.snapshot-marker { position: absolute; bottom: 2px; transform: translateX(-50%); color: #b45309; border: 0; background: transparent; cursor: pointer; font-size: 13px; padding: 0; }.timeline-labels { display: flex; justify-content: space-between; font-size: 12px; color: #64748b; margin-top: 5px; }.scrubber-row input { flex: 1; min-width: 200px; accent-color: #2563eb; } output { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #334155; }
-@media (max-width: 640px) { .card { padding: 16px; }.range-controls label,.range-controls input { width: 100%; }.timeline-bars { height: 115px; } }
+.timeline-shell { margin-top: 18px; }.timeline-bars { position: relative; height: var(--timeline-height); border: 1px solid #dbe3ee; border-radius: 9px 9px 0 0; overflow: hidden; background: linear-gradient(to bottom, #f8fbff, #fff); }.timeline-bar { position: absolute; bottom: 0; min-width: 1px; border: 0; border-left: 1px solid #ffffff80; background: linear-gradient(#60a5fa, #2563eb); cursor: pointer; border-radius: 2px 2px 0 0; }.timeline-bar.empty { background: #dbeafe; }.timeline-bar:hover { background: #1d4ed8; }.snapshot-marker { position: absolute; transform: translateX(-50%); z-index: 2; color: #b45309; border: 0; background: transparent; cursor: pointer; font-size: 14px; line-height: 14px; padding: 0; text-shadow: 0 1px #fff; }.timeline-labels { display: flex; justify-content: space-between; font-size: 12px; color: #64748b; margin-top: 5px; }.scrubber-row input { flex: 1; min-width: 200px; accent-color: #2563eb; } output { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #334155; }
+@media (max-width: 640px) { .card { padding: 16px; }.range-controls label,.range-controls input { width: 100%; }.timeline-bars { min-height: 115px; } }
 </style>

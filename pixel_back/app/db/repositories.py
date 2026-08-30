@@ -157,18 +157,29 @@ async def list_moderation_states(session: AsyncSession, limit: int = 100) -> lis
 
 async def list_snapshot_markers(
     session: AsyncSession, *, start: datetime, end: datetime, limit: int = 500
-) -> list[CanvasSnapshot]:
-    rows = await session.scalars(
-        select(CanvasSnapshot)
+) -> list[tuple[CanvasSnapshot, datetime]]:
+    """Return snapshots anchored to the last event they contain.
+
+    Snapshot files are written asynchronously, therefore ``created_at`` can
+    lag the captured canvas revision.  Timeline placement must use the event
+    time associated with ``last_log_id`` instead.
+    """
+    marker_time = func.coalesce(PixelLog.created_at, CanvasSnapshot.created_at).label('marker_time')
+    rows = await session.execute(
+        select(CanvasSnapshot, marker_time)
+        .outerjoin(PixelLog, PixelLog.id == CanvasSnapshot.last_log_id)
         .where(
             CanvasSnapshot.status == 'valid',
-            CanvasSnapshot.created_at >= start,
-            CanvasSnapshot.created_at <= end,
+            marker_time >= start,
+            marker_time <= end,
         )
-        .order_by(CanvasSnapshot.created_at.asc())
+        .order_by(marker_time.asc(), CanvasSnapshot.id.asc())
         .limit(limit)
     )
-    return list(rows.all())
+    return [
+        (snapshot, marker if isinstance(marker, datetime) else snapshot.created_at)
+        for snapshot, marker in rows
+    ]
 
 
 async def get_latest_pixel_id(session: AsyncSession) -> int:
@@ -372,6 +383,30 @@ async def list_pixels_between(
     return list((await session.scalars(statement.order_by(PixelLog.id))).all())
 
 
+async def count_pixels_between(
+    session: AsyncSession,
+    *,
+    after_id: int,
+    through_id: int,
+    x_min: int,
+    x_max: int,
+    y_min: int,
+    y_max: int,
+) -> int:
+    """Count historical changes an exact restoration would overwrite."""
+    value = await session.scalar(
+        select(func.count(PixelLog.id)).where(
+            PixelLog.id > after_id,
+            PixelLog.id <= through_id,
+            PixelLog.x >= x_min,
+            PixelLog.x <= x_max,
+            PixelLog.y >= y_min,
+            PixelLog.y <= y_max,
+        )
+    )
+    return int(value or 0)
+
+
 async def list_latest_pixel_ids_in_bounds(
     session: AsyncSession,
     *,
@@ -415,10 +450,26 @@ async def list_recent_visitor_pixels(
     return list(reversed((await session.scalars(statement)).all()))
 
 
+async def get_latest_pixel_at(
+    session: AsyncSession, *, x: int, y: int
+) -> PixelLog | None:
+    """Return the durable last writer for one coordinate."""
+    return await session.scalar(
+        select(PixelLog)
+        .where(PixelLog.x == x, PixelLog.y == y)
+        .order_by(PixelLog.id.desc())
+        .limit(1)
+    )
+
+
 async def list_recent_risk_pixels(session: AsyncSession, *, since: datetime, limit: int = 10000) -> list[PixelLog]:
     rows = await session.scalars(
         select(PixelLog)
-        .where(PixelLog.visitor_id.is_not(None), PixelLog.created_at >= since)
+        .where(
+            PixelLog.visitor_id.is_not(None),
+            PixelLog.created_at >= since,
+            PixelLog.source != 'user_self_edit',
+        )
         .order_by(PixelLog.id.desc())
         .limit(limit)
     )

@@ -60,6 +60,7 @@ class ApplicationRuntime:
             self.abuse,
             self.health,
             read_only=settings.canvas_read_only,
+            self_edit_grace_seconds=settings.self_edit_grace_seconds,
         )
         self.admin_auth = AdminAuth(
             settings.admin_token_hash,
@@ -88,6 +89,7 @@ class ApplicationRuntime:
 
     async def start(self) -> None:
         self.snapshot_store.ensure_directory()
+        self.admin_previews.cleanup()
         async with self.session_factory() as session:
             await session.execute(text('SELECT 1'))
         initialization = await initialize_canvas(self.canvas_state, self.session_factory, self.snapshot_store)
@@ -108,6 +110,7 @@ class ApplicationRuntime:
         self.health.ready = False
         self.health.draining = True
         await self.hub.close_all()
+        await self.moderation.stop()
         # Drain post-commit events first so threshold accounting reaches the
         # snapshot worker before it is asked to finish.
         await self.dispatcher.stop()

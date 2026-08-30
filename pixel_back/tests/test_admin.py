@@ -37,13 +37,16 @@ class AdminPreviewCacheTests(unittest.TestCase):
             store = SnapshotStore(Path(temporary), 1, 1)
             store.ensure_directory()
             filename = 'preview-test-preview.png'
+            difference_filename = 'preview-test-preview-diff.png'
             store.path_for(filename).write_bytes(b'preview')
+            store.path_for(difference_filename).write_bytes(b'difference')
             cache = AdminPreviewCache(store, ttl_seconds=10)
 
             with patch('app.admin.previews.monotonic', return_value=100):
                 cache.add(
                     preview_id='test-preview',
                     filename=filename,
+                    difference_filename=difference_filename,
                     target_event_id=10,
                     head_event_id=20,
                     difference_pixels=3,
@@ -53,3 +56,4 @@ class AdminPreviewCacheTests(unittest.TestCase):
             with patch('app.admin.previews.monotonic', return_value=111):
                 self.assertIsNone(cache.get('test-preview'))
             self.assertFalse(store.path_for(filename).exists())
+            self.assertFalse(store.path_for(difference_filename).exists())

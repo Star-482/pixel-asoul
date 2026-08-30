@@ -60,6 +60,34 @@ class RiskWindowTests(unittest.TestCase):
         risk = window.assess('#333333', '#222222')
         self.assertEqual(3, risk.overwrite_cost)
 
+    def test_first_same_target_overwrite_keeps_normal_cost(self):
+        risk = RiskWindow().assess('#111111', '#222222')
+
+        self.assertEqual(1, risk.overwrite_cost)
+        self.assertEqual(0.0, risk.same_target_ratio)
+
+    def test_same_target_escalates_only_after_twenty_overwrites(self):
+        window = RiskWindow()
+        for _ in range(19):
+            window.record('#111111', '#222222')
+
+        risk = window.assess('#333333', '#222222')
+
+        self.assertEqual(3, risk.overwrite_cost)
+        self.assertEqual(1.0, risk.same_target_ratio)
+
+    def test_full_window_simulates_replacement_instead_of_counting_twenty_one_events(self):
+        window = RiskWindow()
+        for _ in range(5):
+            window.record('#FFFFFF', '#111111')
+        for _ in range(15):
+            window.record('#111111', '#222222')
+
+        risk = window.assess('#333333', '#444444')
+
+        self.assertEqual(0.8, risk.recent_overwrite_ratio)
+        self.assertEqual(3, risk.overwrite_cost)
+
 
 class PostVerificationRiskTests(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_overwrite_exhaustion_after_successful_captcha_blocks(self):
@@ -135,3 +163,48 @@ class PostVerificationRiskTests(unittest.IsolatedAsyncioTestCase):
             state.challenge_required_until,
             now + timedelta(hours=1),
         )
+
+
+class RecentSelfEditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recent_self_edit_skips_only_overwrite_protection(self):
+        settings = cast(
+            Settings,
+            SimpleNamespace(
+                abuse_mode='enforce',
+                ws_bucket_capacity=40,
+                ws_bucket_refill_per_second=10,
+                visitor_bucket_capacity=12,
+                visitor_bucket_refill_per_second=3,
+                ip_bucket_capacity=120,
+                ip_bucket_refill_per_second=30,
+                overwrite_bucket_capacity=20,
+                overwrite_refill_seconds=15,
+            ),
+        )
+        state = ModerationState(
+            visitor_id='visitor-1',
+            challenge_required_until=datetime.now(timezone.utc) + timedelta(hours=1),
+            strike_count=0,
+            challenge_failures=0,
+        )
+        guard = AbuseGuard(settings, cast(AsyncSessionFactory, _SessionFactory()))
+
+        with patch(
+            'app.abuse.service.repositories.get_moderation_state',
+            AsyncMock(return_value=state),
+        ):
+            reservation = await guard.reserve_draw(
+                'visitor-1',
+                '203.0.113.1',
+                '#111111',
+                '#222222',
+                is_recent_self_edit=True,
+            )
+
+        self.assertEqual(0, reservation.overwrite_cost)
+        self.assertIsNone(reservation.overwrite_bucket)
+        self.assertTrue(reservation.is_recent_self_edit)
+        await guard.commit(reservation, '#111111', '#222222')
+        risk = guard._risk_windows['visitor-1'].assess('#333333', '#222222')
+        self.assertEqual(1, risk.overwrite_cost)
+        self.assertEqual(0.0, risk.recent_overwrite_ratio)
