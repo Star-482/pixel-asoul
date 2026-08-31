@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta, timezone
 import unittest
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.dialects import postgresql
 
-from app.moderation.timeline import _continuous_density_buckets, _modification_density_statement
+from app.moderation.timeline import _as_utc, _continuous_density_buckets, _modification_density_statement
 
 
 class TimelineQueryTests(unittest.TestCase):
@@ -35,3 +36,14 @@ class TimelineQueryTests(unittest.TestCase):
         self.assertEqual(start.isoformat(), buckets[0]['start'])
         self.assertEqual(end.isoformat(), buckets[-1]['end'])
         self.assertEqual([3, 4, 0], [bucket['count'] for bucket in buckets])
+
+    def test_legacy_naive_timestamps_are_interpreted_as_shanghai_time(self):
+        legacy_value = datetime(2026, 8, 30, 16, 0)
+        self.assertEqual(
+            datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc),
+            _as_utc(legacy_value),
+        )
+        self.assertEqual(
+            datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc),
+            _as_utc(datetime(2026, 8, 30, 16, 0, tzinfo=ZoneInfo('Asia/Shanghai'))),
+        )

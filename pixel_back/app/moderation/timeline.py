@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from numpy.typing import NDArray
@@ -11,6 +12,9 @@ from app.canvas.state import CanvasState
 from app.db.models import PixelLog
 from app.db.session import AsyncSessionFactory
 from app.snapshots.store import SnapshotStore
+
+
+SHANGHAI = ZoneInfo('Asia/Shanghai')
 
 
 async def event_id_at_time(session_factory: AsyncSessionFactory, target: datetime) -> int:
@@ -106,7 +110,12 @@ def _next_interval_boundary(value: datetime, interval: timedelta) -> datetime:
 
 
 def _as_utc(value: datetime) -> datetime:
-    return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if value.tzinfo is None:
+        # The one-time migration converts these legacy values to timestamptz.
+        # Until it is applied, they retain the deployment's Shanghai wall-clock
+        # meaning; relabeling them as UTC shifts the timeline by eight hours.
+        return value.replace(tzinfo=SHANGHAI).astimezone(timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _modification_density_statement(start: datetime, end: datetime) -> Select:

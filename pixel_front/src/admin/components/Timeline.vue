@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
+import { parseApiInstant, shanghaiDatetimeLocalToIso, toShanghaiDatetimeLocal } from '../time';
 
 const props = defineProps({
   buckets: { type: Array, default: () => [] },
@@ -18,14 +19,11 @@ const playing = ref(false);
 let playbackTimer = null;
 
 function toInput(value) {
-  if (!value) return '';
-  const date = new Date(value);
-  const offset = date.getTimezoneOffset() * 60000;
-  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+  return toShanghaiDatetimeLocal(value);
 }
 
 function toIso(value) {
-  return value ? new Date(value).toISOString() : '';
+  return shanghaiDatetimeLocalToIso(value);
 }
 
 watch(() => [props.start, props.end], ([start, end]) => {
@@ -34,8 +32,8 @@ watch(() => [props.start, props.end], ([start, end]) => {
 }, { immediate: true });
 
 const maxCount = computed(() => Math.max(1, ...props.buckets.map(bucket => Number(bucket.count) || 0)));
-const startMs = computed(() => new Date(props.start).getTime());
-const endMs = computed(() => new Date(props.end).getTime());
+const startMs = computed(() => parseApiInstant(props.start).getTime());
+const endMs = computed(() => parseApiInstant(props.end).getTime());
 const timeSpan = computed(() => Math.max(1, endMs.value - startMs.value));
 
 function timeRatio(time) {
@@ -44,20 +42,20 @@ function timeRatio(time) {
 
 watch(() => props.selectedTime, time => {
   if (!time) return;
-  position.value = Math.round(timeRatio(new Date(time).getTime()) * 1000) / 10;
+  position.value = Math.round(timeRatio(parseApiInstant(time).getTime()) * 1000) / 10;
 });
 
 const snapshotMarkers = computed(() => {
   const lanes = new Map();
   return [...props.snapshots]
     .map(snapshot => ({ ...snapshot, timeline_time: snapshot.event_time || snapshot.created_at }))
-    .filter(snapshot => Number.isFinite(new Date(snapshot.timeline_time).getTime()))
-    .sort((left, right) => new Date(left.timeline_time) - new Date(right.timeline_time) || Number(left.id) - Number(right.id))
+    .filter(snapshot => Number.isFinite(parseApiInstant(snapshot.timeline_time).getTime()))
+    .sort((left, right) => parseApiInstant(left.timeline_time) - parseApiInstant(right.timeline_time) || Number(left.id) - Number(right.id))
     .map(snapshot => {
-      const time = new Date(snapshot.timeline_time).getTime();
+      const time = parseApiInstant(snapshot.timeline_time).getTime();
       const bucket = props.buckets.find((item, index) => {
-        const bucketStart = new Date(item.start).getTime();
-        const bucketEnd = new Date(item.end).getTime();
+        const bucketStart = parseApiInstant(item.start).getTime();
+        const bucketEnd = parseApiInstant(item.end).getTime();
         return time >= bucketStart && (time < bucketEnd || (index === props.buckets.length - 1 && time <= bucketEnd));
       });
       const key = bucket?.start || `outside-${snapshot.timeline_time}`;
@@ -75,13 +73,13 @@ const timelineStyle = computed(() => {
 function formatTime(value) {
   return new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
-  }).format(new Date(value));
+  }).format(parseApiInstant(value));
 }
 
 function emitRange() {
   const start = toIso(startInput.value);
   const end = toIso(endInput.value);
-  if (!start || !end || new Date(start) >= new Date(end)) return;
+  if (!start || !end || parseApiInstant(start) >= parseApiInstant(end)) return;
   emit('change-range', { start, end });
 }
 
@@ -93,16 +91,16 @@ function selectAtRatio(rawRatio) {
 }
 
 function selectBucket(bucket) {
-  selectAtRatio(timeRatio(new Date(bucket.start).getTime()));
+  selectAtRatio(timeRatio(parseApiInstant(bucket.start).getTime()));
 }
 
 function selectSnapshot(snapshot) {
-  selectAtRatio(timeRatio(new Date(snapshot.timeline_time).getTime()));
+  selectAtRatio(timeRatio(parseApiInstant(snapshot.timeline_time).getTime()));
 }
 
 function bucketStyle(bucket) {
-  const left = timeRatio(new Date(bucket.start).getTime()) * 100;
-  const right = timeRatio(new Date(bucket.end).getTime()) * 100;
+  const left = timeRatio(parseApiInstant(bucket.start).getTime()) * 100;
+  const right = timeRatio(parseApiInstant(bucket.end).getTime()) * 100;
   const count = Number(bucket.count) || 0;
   return {
     left: `${left}%`,
@@ -113,13 +111,13 @@ function bucketStyle(bucket) {
 
 function markerStyle(snapshot) {
   return {
-    left: `${timeRatio(new Date(snapshot.timeline_time).getTime()) * 100}%`,
+    left: `${timeRatio(parseApiInstant(snapshot.timeline_time).getTime()) * 100}%`,
     bottom: `${4 + snapshot.lane * 18}px`,
   };
 }
 
 function shift(minutes) {
-  const selected = props.selectedTime ? new Date(props.selectedTime).getTime() : endMs.value;
+  const selected = props.selectedTime ? parseApiInstant(props.selectedTime).getTime() : endMs.value;
   const time = Math.min(endMs.value, Math.max(startMs.value, selected + minutes * 60 * 1000));
   selectAtRatio((time - startMs.value) / timeSpan.value);
 }

@@ -1,5 +1,6 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue';
+import { shanghaiDatetimeLocalToIso, toShanghaiDatetimeLocal } from '../time';
 
 const props = defineProps({
   canvas: { type: Object, required: true },
@@ -58,7 +59,7 @@ const selectionStyle = computed(() => {
 
 function previewPayload() {
   if (form.target_event_id !== '' && form.target_event_id !== null) return { target_event_id: Number(form.target_event_id) };
-  if (form.target_time) return { target_time: new Date(form.target_time).toISOString() };
+  if (form.target_time) return { target_time: shanghaiDatetimeLocalToIso(form.target_time) };
   return null;
 }
 
@@ -132,9 +133,13 @@ function setTargetTime(time) {
 }
 
 function toLocalInput(value) {
-  const date = new Date(value);
-  const offset = date.getTimezoneOffset() * 60000;
-  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+  return toShanghaiDatetimeLocal(value);
+}
+
+function formatPlanExpiry(value) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).format(new Date(value));
 }
 
 defineExpose({ setTargetTime });
@@ -178,7 +183,7 @@ defineExpose({ setTargetTime });
 
     <div v-if="plan" class="plan-box">
       <strong>恢复计划已生成：{{ plan.affected_pixels.toLocaleString() }} 个像素</strong>
-      <span>计划会在 {{ new Date(plan.expires_at).toLocaleTimeString('zh-CN') }} 失效；画布变化后须重新生成。</span>
+      <span>计划会在 {{ formatPlanExpiry(plan.expires_at) }} 失效；画布变化后须重新生成。</span>
       <span v-if="form.mode === 'exact'">此恢复将覆盖 {{ (plan.subsequent_changes ?? 0).toLocaleString() }} 条目标事件后的修改。</span>
       <label v-if="fullCanvas">整图精确恢复确认 <input v-model="confirmationText" placeholder="请输入：恢复整图" /></label>
       <button class="danger" :disabled="busy" @click="executePlan">执行恢复</button>

@@ -171,7 +171,7 @@ async def list_snapshot_markers(
         .where(
             CanvasSnapshot.status == 'valid',
             marker_time >= start,
-            marker_time <= end,
+            marker_time < end,
         )
         .order_by(marker_time.asc(), CanvasSnapshot.id.asc())
         .limit(limit)
