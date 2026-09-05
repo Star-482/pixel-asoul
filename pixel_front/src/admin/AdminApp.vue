@@ -13,9 +13,9 @@ const notice = ref('');
 const loading = ref(false);
 const actionBusy = ref(false);
 const restorePanel = ref(null);
-const status = ref({ canvas: { width: 1000, height: 1000, head_event_id: 0, draw_enabled: false }, stats: {}, captcha: {} });
+const status = ref({ canvas: { width: 1000, height: 1000, head_event_id: 0, draw_enabled: false }, stats: {} });
 const timeline = ref({ buckets: [], snapshots: [] });
-const moderation = ref({ items: [], captcha_degraded: false });
+const moderation = ref({ items: [] });
 const actions = ref([]);
 const preview = ref(null);
 const plan = ref(null);
@@ -250,14 +250,14 @@ onBeforeUnmount(() => { clearTimeout(previewTimer); clearInterval(operationTimer
       <section class="status-grid">
         <div class="status-card"><span>画布状态</span><strong :class="canvas.draw_enabled ? 'good' : 'danger-text'">{{ canvas.draw_enabled ? '可绘制' : '维护只读' }}</strong><small>事件 #{{ canvas.head_event_id.toLocaleString() }}</small></div>
         <div class="status-card"><span>当前在线</span><strong>{{ stats.online_users ?? 0 }}</strong><small>累计访问 {{ (stats.total_visits ?? 0).toLocaleString() }}</small></div>
-        <div class="status-card"><span>累计用户绘制</span><strong>{{ (stats.total_placed_pixels ?? 0).toLocaleString() }}</strong><small>{{ status.captcha?.enabled ? (status.captcha?.degraded ? '验证码服务降级' : '验证码服务可用') : '未配置验证码' }}</small></div>
+        <div class="status-card"><span>累计用户绘制</span><strong>{{ (stats.total_placed_pixels ?? 0).toLocaleString() }}</strong><small>覆盖滥用以递进冷却处置</small></div>
       </section>
 
       <section class="card read-only-card"><div><h2>全局维护开关</h2><p>开启后服务端会拒绝所有新的绘制请求，并实时通知已连接用户。</p></div><label class="switch"><input v-model="readOnly" type="checkbox" :disabled="actionBusy" @change="setReadOnly" /><span></span>维护只读</label></section>
 
       <Timeline :buckets="timeline.buckets" :snapshots="timeline.snapshots" :start="timelineRange.start" :end="timelineRange.end" :selected-time="selectedTime" :loading="loading" @change-range="changeRange" @select-time="selectTimelineTime" />
       <RestorePanel ref="restorePanel" :canvas="canvas" :preview="preview" :plan="plan" :operation="operation" :selected-time="selectedTime" :busy="actionBusy" @create-preview="createPreview" @create-plan="createPlan" @execute-plan="executePlan" />
-      <ModerationList :items="moderation.items" :captcha-degraded="moderation.captcha_degraded" :busy="actionBusy" @block="blockVisitor" @unblock="unblockVisitor" />
+      <ModerationList :items="moderation.items" :busy="actionBusy" @block="blockVisitor" @unblock="unblockVisitor" />
       <AuditLog :items="actions" />
     </template>
   </main>

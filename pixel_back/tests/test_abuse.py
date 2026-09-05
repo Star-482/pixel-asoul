@@ -5,7 +5,7 @@ from typing import cast
 from unittest.mock import AsyncMock, patch
 
 from app.abuse.risk import RiskWindow
-from app.abuse.service import AbuseGuard
+from app.abuse.service import AbuseGuard, AbuseRejected
 from app.abuse.token_bucket import TokenBucket
 from app.core.settings import Settings
 from app.db.models import ModerationState
@@ -89,22 +89,24 @@ class RiskWindowTests(unittest.TestCase):
         self.assertEqual(3, risk.overwrite_cost)
 
 
-class PostVerificationRiskTests(unittest.IsolatedAsyncioTestCase):
-    async def test_repeated_overwrite_exhaustion_after_successful_captcha_blocks(self):
-        now = datetime(2026, 8, 30, tzinfo=timezone.utc)
-        state = ModerationState(
-            visitor_id='visitor-1', strike_count=0, challenge_failures=0
-        )
-        guard = AbuseGuard(
+class OverwriteCooldownTests(unittest.IsolatedAsyncioTestCase):
+    def _guard(self) -> AbuseGuard:
+        return AbuseGuard(
             cast(
                 Settings,
                 SimpleNamespace(
-                    verified_risk_window_minutes=10,
-                    verified_risk_block_minutes=30,
+                    overwrite_cooldown_seconds=30,
+                    overwrite_watch_minutes=10,
+                    overwrite_escalation_minutes=30,
                 ),
             ),
             cast(AsyncSessionFactory, _SessionFactory()),
         )
+
+    async def test_first_exhaustion_sets_short_cooldown_and_watch_window(self):
+        now = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        state = ModerationState(visitor_id='visitor-1', strike_count=0)
+        guard = self._guard()
 
         with (
             patch(
@@ -113,41 +115,27 @@ class PostVerificationRiskTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch('app.abuse.service.utc_now', return_value=now),
         ):
-            await guard.verify_challenge('visitor-1', True)
-            self.assertEqual(
-                state.post_verification_watch_until,
-                now + timedelta(minutes=10),
-            )
-            self.assertEqual(state.verified_until, now + timedelta(hours=1))
-            await guard._record_overwrite_exhaustion('visitor-1')
+            seconds = await guard._record_overwrite_exhaustion('visitor-1')
 
+        self.assertEqual(30, seconds)
         self.assertEqual(
-            state.blocked_until,
-            now + timedelta(minutes=30),
+            state.overwrite_cooldown_until,
+            now + timedelta(seconds=30),
         )
-        self.assertIsNone(state.post_verification_watch_until)
-        self.assertIsNone(state.verified_until)
-        self.assertIsNone(state.challenge_required_until)
-        self.assertEqual(state.strike_count, 1)
+        self.assertEqual(
+            state.overwrite_watch_until,
+            now + timedelta(seconds=30) + timedelta(minutes=10),
+        )
+        self.assertEqual(0, state.strike_count)
 
-    async def test_expired_post_verification_window_requires_a_new_challenge(self):
-        now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    async def test_exhaustion_during_watch_escalates_to_long_cooldown(self):
+        now = datetime(2026, 9, 5, tzinfo=timezone.utc)
         state = ModerationState(
             visitor_id='visitor-1',
-            post_verification_watch_until=now - timedelta(seconds=1),
+            overwrite_watch_until=now + timedelta(minutes=5),
             strike_count=0,
-            challenge_failures=0,
         )
-        guard = AbuseGuard(
-            cast(
-                Settings,
-                SimpleNamespace(
-                    verified_risk_window_minutes=10,
-                    verified_risk_block_minutes=30,
-                ),
-            ),
-            cast(AsyncSessionFactory, _SessionFactory()),
-        )
+        guard = self._guard()
 
         with (
             patch(
@@ -156,13 +144,75 @@ class PostVerificationRiskTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch('app.abuse.service.utc_now', return_value=now),
         ):
-            await guard._record_overwrite_exhaustion('visitor-1')
+            seconds = await guard._record_overwrite_exhaustion('visitor-1')
 
-        self.assertIsNone(state.blocked_until)
+        self.assertEqual(1800, seconds)
         self.assertEqual(
-            state.challenge_required_until,
-            now + timedelta(hours=1),
+            state.overwrite_cooldown_until,
+            now + timedelta(minutes=30),
         )
+        self.assertEqual(
+            state.overwrite_watch_until,
+            now + timedelta(minutes=30) + timedelta(minutes=10),
+        )
+        self.assertEqual(1, state.strike_count)
+
+    async def test_expired_watch_window_resets_to_short_cooldown(self):
+        now = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        state = ModerationState(
+            visitor_id='visitor-1',
+            overwrite_watch_until=now - timedelta(seconds=1),
+            strike_count=2,
+        )
+        guard = self._guard()
+
+        with (
+            patch(
+                'app.abuse.service.repositories.get_moderation_state',
+                AsyncMock(return_value=state),
+            ),
+            patch('app.abuse.service.utc_now', return_value=now),
+        ):
+            seconds = await guard._record_overwrite_exhaustion('visitor-1')
+
+        self.assertEqual(30, seconds)
+        self.assertEqual(2, state.strike_count)
+
+    async def test_active_cooldown_rejects_destructive_overwrite_only(self):
+        settings = SimpleNamespace(
+            abuse_mode='enforce',
+            overwrite_cooldown_seconds=30,
+            overwrite_watch_minutes=10,
+            overwrite_escalation_minutes=30,
+            ws_bucket_capacity=40,
+            ws_bucket_refill_per_second=10,
+            visitor_bucket_capacity=12,
+            visitor_bucket_refill_per_second=3,
+            ip_bucket_capacity=120,
+            ip_bucket_refill_per_second=30,
+            overwrite_bucket_capacity=20,
+            overwrite_refill_seconds=15,
+        )
+        now = datetime.now(timezone.utc)
+        state = ModerationState(
+            visitor_id='visitor-1',
+            overwrite_cooldown_until=now + timedelta(seconds=25),
+            strike_count=0,
+        )
+        guard = AbuseGuard(cast(Settings, settings), cast(AsyncSessionFactory, _SessionFactory()))
+
+        with patch(
+            'app.abuse.service.repositories.get_moderation_state',
+            AsyncMock(return_value=state),
+        ):
+            with self.assertRaises(AbuseRejected) as context:
+                await guard.reserve_draw(
+                    'visitor-1', '203.0.113.1', '#111111', '#222222'
+                )
+
+        rejection = context.exception
+        self.assertEqual('destructive_cooldown', rejection.code)
+        self.assertGreaterEqual(rejection.retry_after, 24)
 
 
 class RecentSelfEditTests(unittest.IsolatedAsyncioTestCase):
@@ -183,9 +233,8 @@ class RecentSelfEditTests(unittest.IsolatedAsyncioTestCase):
         )
         state = ModerationState(
             visitor_id='visitor-1',
-            challenge_required_until=datetime.now(timezone.utc) + timedelta(hours=1),
+            overwrite_cooldown_until=datetime.now(timezone.utc) + timedelta(seconds=30),
             strike_count=0,
-            challenge_failures=0,
         )
         guard = AbuseGuard(settings, cast(AsyncSessionFactory, _SessionFactory()))
 

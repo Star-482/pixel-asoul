@@ -9,4 +9,3 @@ pydantic>=2.7,<3
 alembic>=1.13,<2
 pillow>=10,<12
 numpy>=2.0,<3
-tencentcloud-sdk-python>=3.0.1200

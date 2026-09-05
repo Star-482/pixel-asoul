@@ -5,16 +5,15 @@ import ColorPicker from './components/ColorPicker.vue';
 import CooldownTimer from './components/CooldownTimer.vue';
 import MobileToolbar from './components/MobileToolbar.vue';
 import FloatingToolbar from './components/FloatingToolbar.vue';
+import OverwriteCooldownModal from './components/OverwriteCooldownModal.vue';
 import ws from './utils/ws.js';
-import { CaptchaCancelledError, openTencentCaptcha } from './utils/tencentCaptcha.js';
 
 // 状态管理
 const selectedColor = ref('#FF0000');
 const canvasBoard = ref(null);
 const cooldownTimer = ref(null);
 const drawEnabled = ref(false);
-const captchaPending = ref(false);
-let captchaRequestId = null;
+const overwriteCooldown = ref(0);
 
 // 移动端状态
 const isMobile = ref(false);
@@ -44,73 +43,19 @@ function showToast(message, type = 'warning', duration = 3000) {
   }, duration);
 }
 
-async function handleChallengeRequired(message) {
-  const challenge = message.data || {};
-  if (captchaPending.value) return;
-  if (challenge.provider !== 'tencent' || !challenge.challenge_id || !challenge.app_id) {
-    showToast('验证码服务暂不可用，请稍后再试', 'error', 5000);
+function handleServerError(message) {
+  const data = message.data || {};
+
+  // Overwrite cooling gets a dedicated modal: the message asks the visitor to
+  // respect others' work and points at the owner's contact page.
+  if (data.code === 'destructive_cooldown') {
+    overwriteCooldown.value = Math.max(1, Math.floor(data.retry_after || 0));
     return;
   }
 
-  captchaPending.value = true;
-  try {
-    showToast('检测到高风险覆盖操作，请完成安全验证', 'warning', 5000);
-    const { ticket, randstr } = await openTencentCaptcha(challenge.app_id);
-    const requestId = crypto.randomUUID();
-    captchaRequestId = requestId;
-    if (!ws.send('challenge.verify', {
-      challenge_id: challenge.challenge_id,
-      ticket,
-      randstr,
-    }, requestId)) {
-      captchaRequestId = null;
-      captchaPending.value = false;
-      showToast('连接已断开，请重连后再试', 'error');
-    }
-  } catch (error) {
-    captchaPending.value = false;
-    captchaRequestId = null;
-    if (error instanceof CaptchaCancelledError) {
-      showToast('已取消安全验证', 'warning');
-    } else {
-      console.error('腾讯验证码启动失败', error);
-      showToast(error.message || '验证码启动失败，请稍后再试', 'error', 5000);
-    }
-  }
-}
+  showToast(data.message || '操作过于频繁，请稍后再试', 'warning');
 
-function handleChallengeResult(message) {
-  const result = message.data || {};
-  if (captchaRequestId && message.request_id && message.request_id !== captchaRequestId) return;
-  captchaPending.value = false;
-  captchaRequestId = null;
-  if (result.success) {
-    showToast('安全验证通过，已恢复覆盖操作', 'success');
-  } else if (result.degraded) {
-    showToast('验证码服务暂时不可用，覆盖操作已进入更严格的冷却限制', 'warning', 5000);
-  } else {
-    showToast('安全验证未通过，请稍后重新验证', 'warning', 5000);
-  }
-}
-
-function handleServerError(message) {
-  const data = message.data || {};
-  if (captchaRequestId && message.request_id === captchaRequestId) {
-    captchaRequestId = null;
-    captchaPending.value = false;
-  }
-  const overwriteOnly = data.code === 'destructive_cooldown';
-  showToast(
-    overwriteOnly
-      ? `覆盖操作冷却中（约 ${data.retry_after || 0} 秒），仍可在空白区域绘制`
-      : data.message || '操作过于频繁，请稍后再试',
-    'warning',
-    overwriteOnly ? 5000 : 3000
-  );
-
-  // Overwrite cooling is intentionally not a visitor-wide draw lock: the
-  // server still permits placing a color on a white pixel. Rate limits and a
-  // temporary drawing block do apply to every placement.
+  // Rate limits and a temporary drawing block apply to every placement.
   const blocksAllDrawing = data.code === 'rate_limited' || data.code === 'drawing_blocked';
   if (blocksAllDrawing && data.retry_after) {
     if (isMobile.value) {
@@ -187,8 +132,6 @@ onMounted(() => {
 
   // V2 errors contain the retry interval and the originating request id.
   ws.on('server_error', handleServerError);
-  ws.on('challenge.required', handleChallengeRequired);
-  ws.on('challenge.result', handleChallengeResult);
 
   // 监听统计信息更新
   ws.on('stats', (data) => {
@@ -209,8 +152,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   stopMobileCooldown();
   ws.off('server_error', handleServerError);
-  ws.off('challenge.required', handleChallengeRequired);
-  ws.off('challenge.result', handleChallengeResult);
   window.matchMedia('(max-width: 639px), (hover: none) and (pointer: coarse)').removeEventListener('change', checkMobile);
 });
 
@@ -334,7 +275,6 @@ function handlePickColor() {
           ref="canvasBoard"
           :selected-color="selectedColor"
           :is-mobile="false"
-          :drawing-locked="captchaPending"
           @draw-enabled="drawEnabled = $event"
           @pixel-placed="() => {}"
         />
@@ -367,6 +307,12 @@ function handlePickColor() {
               绘画过程可视化
             </a>
           </div>
+          <div class="bili-link">
+            <img src="./assets/bilibili_play.png" alt="Bilibili" class="bili-icon" />
+            <a href="https://space.bilibili.com/259253013" target="_blank" rel="noopener noreferrer">
+              联系站长
+            </a>
+          </div>
         </div>
       </aside>
     </div>
@@ -380,7 +326,6 @@ function handlePickColor() {
             :selected-color="selectedColor"
             :is-mobile="true"
             :is-crosshair-mode="isCrosshairMode"
-            :drawing-locked="captchaPending"
             @draw-enabled="drawEnabled = $event"
             @pixel-placed="() => {}"
             @crosshair-change="crosshairCoord = $event"
@@ -399,7 +344,7 @@ function handlePickColor() {
         :selected-color="selectedColor"
         :cooldown-seconds="mobileCooldown"
         :is-crosshair-mode="isCrosshairMode"
-        :disabled="!drawEnabled || captchaPending"
+        :disabled="!drawEnabled"
         :crosshair-coord="crosshairCoord"
         @open-color-picker="openColorPicker"
         @place-pixel="handlePlacePixel"
@@ -452,11 +397,20 @@ function handlePickColor() {
                   绘画过程可视化
                 </a>
               </div>
+              <div class="bili-link">
+                <img src="./assets/bilibili_play.png" alt="Bilibili" class="bili-icon" />
+                <a href="https://space.bilibili.com/259253013" target="_blank" rel="noopener noreferrer">
+                  联系站长
+                </a>
+              </div>
             </div>
           </div>
         </div>
       </Transition>
     </template>
+
+    <!-- 覆盖冷却提示弹窗 -->
+    <OverwriteCooldownModal :seconds="overwriteCooldown" @close="overwriteCooldown = 0" />
   </div>
 </template>
 
@@ -828,6 +782,12 @@ function handlePickColor() {
 /* ===== B站链接 ===== */
 .bili-card {
   padding: 12px 16px;
+}
+
+.bili-card .bili-link + .bili-link {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-light);
 }
 
 .bili-link {

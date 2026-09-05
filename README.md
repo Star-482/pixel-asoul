@@ -9,7 +9,7 @@ Vue Canvas ── HTTP V2 / WebSocket V2 ── FastAPI adapters
                                           ↓
                      canvas / abuse / moderation / admin applications
                                           ↓
-                           PostgreSQL + snapshots/ + Tencent Captcha
+                           PostgreSQL + snapshots/
 ```
 
 像素写入始终遵循：验证与限流 → PostgreSQL 事务 → 内存画布 → 有序事件队列 → WebSocket 广播/快照计数。客户端以 `request_id` 重试不会产生重复 `PixelLog`。
@@ -69,6 +69,6 @@ chmod +x run.sh
 
 ## 匿名反破坏与管理
 
-匿名绘制保留。默认 `ABUSE_MODE=observe` 只记录风险；观察至少七天并审阅数据后再切到 `enforce`。策略包括访客/IP/覆盖令牌桶、覆盖风险加权、腾讯验证码与渐进封禁。管理员可查看时间轴、生成历史预览、创建恢复计划、封禁访客和开启维护只读；所有变更写入审计与新的像素历史，不删除旧日志。
+匿名绘制保留。默认 `ABUSE_MODE=observe` 只记录风险；观察至少七天并审阅数据后再切到 `enforce`。策略包括访客/IP/覆盖令牌桶、覆盖风险加权与递进覆盖冷却。管理员可查看时间轴、生成历史预览、创建恢复计划、封禁访客和开启维护只读；所有变更写入审计与新的像素历史，不删除旧日志。
 
-启用腾讯验证码前，在腾讯云创建 Web/H5 验证并将生产域名加入允许范围，再填写 `.env` 的四个 `TENCENT_*` 配置。前端只会在服务端发出 `challenge.required` 时按需加载腾讯验证码脚本，取得 `ticket`、`randstr` 后经 WebSocket 交由服务端二次校验；腾讯云密钥不会下发到浏览器。当前实现未启用腾讯云控制台的 `CaptchaAppId` 强制鉴权（`aidEncrypted`）功能。
+覆盖预算耗尽后进入递进冷却：首次耗尽触发 30 秒覆盖冷却（`OVERWRITE_COOLDOWN_SECONDS`）并弹窗提示勿覆盖他人作品；冷却结束后进入 10 分钟观察期（`OVERWRITE_WATCH_MINUTES`），观察期内再次耗尽覆盖预算则冷却升级为 30 分钟（`OVERWRITE_ESCALATION_MINUTES`）。冷却期间仍可在空白像素绘制，无需人机验证。

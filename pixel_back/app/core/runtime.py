@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from time import monotonic
 from sqlalchemy import text
 
 from app.admin.auth import AdminAuth
 from app.admin.previews import AdminPreviewCache
 from app.admin.service import AdminApplication
-from app.abuse.challenge import Challenge, ChallengeProvider
 from app.abuse.identity import VisitorIdentity
 from app.abuse.service import AbuseGuard
 from app.canvas.initializer import initialize_canvas
@@ -38,13 +36,6 @@ class ApplicationRuntime:
         self.stats = StatsApplication(self.session_factory)
         self.identity = VisitorIdentity(settings.visitor_cookie_secret, settings.visitor_cookie_days)
         self.abuse = AbuseGuard(settings, self.session_factory)
-        self.challenge_provider = ChallengeProvider(
-            settings.tencent_captcha_app_id,
-            settings.tencent_secret_id,
-            settings.tencent_secret_key,
-            settings.tencent_captcha_app_secret_key,
-        )
-        self.challenges: dict[str, tuple[str, str, float]] = {}
 
         self.snapshot_worker = SnapshotWorker(
             self.canvas_state,
@@ -75,17 +66,6 @@ class ApplicationRuntime:
         from app.moderation.service import ModerationApplication
         self.moderation = ModerationApplication(self)
         self.dispatcher.subscribe(RealtimeEventHandler(self.hub, self.snapshot_worker, self.stats))
-
-    def issue_challenge(self, visitor_id: str, client_ip: str) -> Challenge:
-        now = monotonic()
-        self.challenges = {key: value for key, value in self.challenges.items() if value[2] > now}
-        challenge = self.challenge_provider.create()
-        self.challenges[challenge.id] = (visitor_id, client_ip, now + 300)
-        return challenge
-
-    def consume_challenge(self, challenge_id: str, visitor_id: str, client_ip: str) -> bool:
-        entry = self.challenges.pop(challenge_id, None)
-        return entry is not None and entry[0] == visitor_id and entry[1] == client_ip and entry[2] > monotonic()
 
     async def start(self) -> None:
         self.snapshot_store.ensure_directory()

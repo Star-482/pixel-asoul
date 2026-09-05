@@ -77,25 +77,13 @@ class Settings:
     overwrite_bucket_capacity: float
     overwrite_refill_seconds: float
     self_edit_grace_seconds: int
-    verified_risk_window_minutes: int
-    verified_risk_block_minutes: int
-    tencent_secret_id: str
-    tencent_secret_key: str
-    tencent_captcha_app_id: str
-    tencent_captcha_app_secret_key: str
+    overwrite_cooldown_seconds: int
+    overwrite_watch_minutes: int
+    overwrite_escalation_minutes: int
 
     @property
     def canvas_size(self) -> int:
         return self.canvas_width * self.canvas_height
-
-    @property
-    def tencent_captcha_enabled(self) -> bool:
-        return bool(
-            self.tencent_secret_id
-            and self.tencent_secret_key
-            and self.tencent_captcha_app_id
-            and self.tencent_captcha_app_secret_key
-        )
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -162,17 +150,14 @@ class Settings:
             ),
             overwrite_refill_seconds=_float("OVERWRITE_REFILL_SECONDS", 15.0, 0.1),
             self_edit_grace_seconds=_int("SELF_EDIT_GRACE_SECONDS", 3600, 1),
-            verified_risk_window_minutes=_int(
-                "VERIFIED_RISK_WINDOW_MINUTES", 10, 1
+            overwrite_cooldown_seconds=_int(
+                "OVERWRITE_COOLDOWN_SECONDS", 30, 1
             ),
-            verified_risk_block_minutes=_int(
-                "VERIFIED_RISK_BLOCK_MINUTES", 30, 1
+            overwrite_watch_minutes=_int(
+                "OVERWRITE_WATCH_MINUTES", 10, 1
             ),
-            tencent_secret_id=os.getenv("TENCENT_SECRET_ID", ""),
-            tencent_secret_key=os.getenv("TENCENT_SECRET_KEY", ""),
-            tencent_captcha_app_id=os.getenv("TENCENT_CAPTCHA_APP_ID", ""),
-            tencent_captcha_app_secret_key=os.getenv(
-                "TENCENT_CAPTCHA_APP_SECRET_KEY", ""
+            overwrite_escalation_minutes=_int(
+                "OVERWRITE_ESCALATION_MINUTES", 30, 1
             ),
         )
         if settings.app_env == "production" and not settings.visitor_cookie_secret:

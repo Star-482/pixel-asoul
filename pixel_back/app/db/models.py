@@ -110,14 +110,10 @@ class ModerationState(Base):
     __tablename__ = "moderation_states"
 
     visitor_id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    verified_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    post_verification_watch_until: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    overwrite_cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    overwrite_watch_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    challenge_required_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     strike_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    challenge_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
     )

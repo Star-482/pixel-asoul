@@ -1,1 +1,1 @@
-"""Anonymous identity, rate budgets, risk decisions and challenges."""
+"""Anonymous identity, rate budgets and overwrite-risk decisions."""

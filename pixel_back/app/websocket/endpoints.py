@@ -12,7 +12,7 @@ from app.core.runtime import ApplicationRuntime
 from app.db import repositories
 from app.realtime.hub import RealtimeConnection
 from app.realtime.protocol import IncomingMessage, ProtocolError, error_payload, parse_message
-from app.schemas.websocket import ChallengeVerifyData, PixelPlaceData
+from app.schemas.websocket import PixelPlaceData
 from app.utils.utils import extract_client_ip_from_websocket
 
 
@@ -99,8 +99,6 @@ async def canvas_websocket(websocket: WebSocket) -> None:
 
             if message.type == 'pixel.place':
                 await _place_pixel(runtime, connection, visitor_id, visit_id, client_ip, message)
-            elif message.type == 'challenge.verify':
-                await _verify_challenge(runtime, connection, visitor_id, client_ip, message)
             else:
                 await runtime.hub.send(connection.id, error_payload('unsupported_type', '不支持的消息类型', request_id=message.request_id))
     except WebSocketDisconnect:
@@ -145,34 +143,9 @@ async def _place_pixel(
         applied = await runtime.canvas.place(PixelCommand(message.request_id, x, y, color, visitor_id, visit_id, client_ip))
     except CanvasRejected as error:
         await runtime.hub.send(connection.id, error_payload(error.code, error.message, request_id=message.request_id, retry_after=error.retry_after))
-        if error.code == 'challenge_required':
-            challenge = runtime.issue_challenge(visitor_id, client_ip)
-            await runtime.hub.send(connection.id, {'type': 'challenge.required', 'data': {'challenge_id': challenge.id, 'provider': challenge.provider, 'app_id': challenge.app_id}})
         return
     await runtime.hub.send(connection.id, {
         'type': 'pixel.ack',
         'request_id': message.request_id,
         'data': {'event_id': applied.event_id, 'duplicate': applied.duplicate},
     })
-
-
-async def _verify_challenge(
-    runtime: ApplicationRuntime,
-    connection: RealtimeConnection,
-    visitor_id: str,
-    client_ip: str,
-    message: IncomingMessage,
-) -> None:
-    try:
-        data = ChallengeVerifyData.model_validate(message.data)
-    except ValidationError:
-        await runtime.hub.send(connection.id, error_payload('invalid_challenge', '验证码数据无效', request_id=message.request_id))
-        return
-    challenge_id = data.challenge_id
-    if not runtime.consume_challenge(challenge_id, visitor_id, client_ip):
-        await runtime.hub.send(connection.id, error_payload('invalid_challenge', '验证码已失效', request_id=message.request_id))
-        return
-    result = await runtime.challenge_provider.verify(data.ticket, data.randstr, client_ip)
-    runtime.abuse.set_challenge_degraded(result is None)
-    await runtime.abuse.verify_challenge(visitor_id, result)
-    await runtime.hub.send(connection.id, {'type': 'challenge.result', 'request_id': message.request_id, 'data': {'success': result is True, 'degraded': result is None}})

@@ -92,10 +92,6 @@ async def status(request: Request) -> dict:
             'draw_enabled': not runtime.canvas.read_only,
         },
         'stats': runtime.stats.current().as_dict(),
-        'captcha': {
-            'enabled': runtime.challenge_provider.enabled,
-            'degraded': runtime.challenge_provider.degraded,
-        },
     }
 
 
@@ -262,16 +258,13 @@ async def moderation(request: Request) -> dict:
                 'visitor_id': row.visitor_id,
                 'display_visitor_id': f'{row.visitor_id[:8]}…',
                 'blocked_until': row.blocked_until,
-                'challenge_required_until': row.challenge_required_until,
-                'post_verification_watch_until': row.post_verification_watch_until,
-                'verified_until': row.verified_until,
+                'overwrite_cooldown_until': row.overwrite_cooldown_until,
+                'overwrite_watch_until': row.overwrite_watch_until,
                 'strike_count': row.strike_count,
-                'challenge_failures': row.challenge_failures,
                 'status': _moderation_status(row, now),
             }
             for row in rows
         ],
-        'captcha_degraded': runtime.challenge_provider.degraded,
     }
 
 
@@ -334,12 +327,12 @@ def _parse_visitor_id(value: str) -> None:
 
 def _moderation_status(row: object, now: datetime) -> str:
     blocked_until = getattr(row, 'blocked_until', None)
-    challenge_until = getattr(row, 'challenge_required_until', None)
-    watch_until = getattr(row, 'post_verification_watch_until', None)
+    cooldown_until = getattr(row, 'overwrite_cooldown_until', None)
+    watch_until = getattr(row, 'overwrite_watch_until', None)
     if blocked_until and blocked_until > now:
         return 'blocked'
-    if challenge_until and challenge_until > now:
-        return 'challenge_required'
+    if cooldown_until and cooldown_until > now:
+        return 'overwrite_cooldown'
     if watch_until and watch_until > now:
         return 'observing'
     return 'normal'
