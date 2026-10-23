@@ -10,11 +10,17 @@ const props = defineProps({
   selectedColor: { type: String, required: true },
   isMobile: { type: Boolean, default: false },
   isCrosshairMode: { type: Boolean, default: false },
+  drawingLocked: { type: Boolean, default: false },
 });
 
 const cooldownEventBus = inject('cooldownEventBus')
 const isCoolingDown = ref(false);
-const emit = defineEmits(['pixel-placed', 'crosshair-change']);
+const drawEnabled = ref(false);
+const syncing = ref(true);
+const pendingPixels = new Map();
+const bufferedEvents = [];
+const latestEventByPixel = new Map();
+const emit = defineEmits(['pixel-placed', 'crosshair-change', 'draw-enabled']);
 const containerRef = ref(null); // 新增：容器引用
 // 响应式状态（translate 以"像素"为单位）
 const canvasRef = ref(null);
@@ -30,6 +36,7 @@ const dragStartX = ref(0); // 新增：记录拖动开始时的X坐标
 const dragStartY = ref(0); // 新增：记录拖动开始时的Y坐标
 const dragThreshold = 5; // 拖动阈值，单位为像素
 const isDraggingForPlacement = ref(false); // 新增：用于判断是否为放置像素的拖动
+const hasDragged = ref(false); // 鼠标按下后是否已越过阈值，进入真正拖动
 
 const dragScaleX = ref(1); // 新增：拖拽时的水平比例修正
 const dragScaleY = ref(1); // 新增：拖拽时的垂直比例修正
@@ -92,7 +99,7 @@ const canvasTransformStyle = computed(() => ({
 
 // 计算鼠标样式
 const canvasCursor = computed(() => {
-  return isCoolingDown.value ? 'not-allowed' : 'pointer';
+  return isCoolingDown.value || !drawEnabled.value || props.drawingLocked ? 'not-allowed' : 'pointer';
 });
 
 onMounted(async () => {
@@ -120,26 +127,25 @@ onMounted(async () => {
   canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
   canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
 
-  // WebSocket
-  ws.on('pixel_update', handlePixelUpdate);
-
-  ws.on('limited', () => {
-    isCoolingDown.value = true;
-    // console.log('已进入冷却时间');
-    // 立即更新游标样式
-    if (canvasRef.value) {
-      canvasRef.value.style.cursor = 'not-allowed';
-    }
-  });
+  // V2 synchronization holds live events until the assigned snapshot and
+  // bounded event range have been painted.
+  ws.on('session.ready', handleSessionReady);
+  ws.on('pixel.updated', handlePixelUpdated);
+  ws.on('error', handleServerError);
+  ws.on('canvas.reload', handleCanvasReload);
+  ws.on('canvas.read_only', handleReadOnlyChanged);
 
   cooldownEventBus.on(handleCooldownEvent)
 
-  // 初始指针
-  canvas.style.cursor = 'pointer';
-  
-  // 获取并绘制最新图片，完成后执行更新
-  await fetchAndDrawLatestImage();
-  fetchAndDrawUpdate();
+  canvas.style.cursor = 'not-allowed';
+  clearCanvas();
+
+  // 像素网格覆盖层：容器尺寸变化时重绘，并执行一次初次绘制
+  if (typeof ResizeObserver !== 'undefined' && containerRef.value) {
+    gridResizeObserver = new ResizeObserver(scheduleDrawGrid);
+    gridResizeObserver.observe(containerRef.value);
+  }
+  scheduleDrawGrid();
 });
 
 onBeforeUnmount(() => {
@@ -155,8 +161,14 @@ onBeforeUnmount(() => {
     canvas.removeEventListener('touchmove', handleTouchMove);
     canvas.removeEventListener('touchend', handleTouchEnd);
   }
-  ws.off('pixel_update', handlePixelUpdate);
+  ws.off('session.ready', handleSessionReady);
+  ws.off('pixel.updated', handlePixelUpdated);
+  ws.off('error', handleServerError);
+  ws.off('canvas.reload', handleCanvasReload);
+  ws.off('canvas.read_only', handleReadOnlyChanged);
   cooldownEventBus.off(handleCooldownEvent)
+  if (gridResizeObserver) gridResizeObserver.disconnect();
+  if (gridRafId) cancelAnimationFrame(gridRafId);
 });
 
 
@@ -199,6 +211,7 @@ function handleWheel(event) {
 // ============ 拖拽（像素空间平移） ============
 function handleMouseDown(event) {
   isDragging.value = true;
+  hasDragged.value = false; // 按下时先进入待判定状态，未越过阈值前不平移
   lastX.value = event.clientX;
   lastY.value = event.clientY;
   dragStartX.value = event.clientX; // 记录拖动开始位置
@@ -226,7 +239,7 @@ function handleMouseDown(event) {
   }
   // === 新增结束 ===
 
-  if (canvasRef.value && !isCoolingDown.value) {
+  if (canvasRef.value && !isCoolingDown.value && drawEnabled.value && !props.drawingLocked) {
     canvasRef.value.style.cursor = 'grabbing';
   }
 }
@@ -236,6 +249,17 @@ function handleMouseMove(event) {
   updateHoverPixel(event);
 
   if (!isDragging.value) return;
+
+  // 未越过阈值前不平移，避免点击时的细微抖动被当成拖动
+  if (!hasDragged.value) {
+    const dx = event.clientX - dragStartX.value;
+    const dy = event.clientY - dragStartY.value;
+    if (dx * dx + dy * dy <= dragThreshold * dragThreshold) return;
+    // 越过阈值，正式开始拖动；同步基准点，避免把判定期间的位移一次性补上
+    hasDragged.value = true;
+    lastX.value = event.clientX;
+    lastY.value = event.clientY;
+  }
 
   // 计算物理位移
   const rawDx = event.clientX - lastX.value;
@@ -257,18 +281,15 @@ function handleMouseMove(event) {
 }
 
 function handleMouseUp() {
-  // 检查鼠标释放位置与初始点击位置的距离
-  const deltaX = Math.abs(lastX.value - dragStartX.value);
-  const deltaY = Math.abs(lastY.value - dragStartY.value);
-  
-  // 如果移动距离超过阈值，则认为是拖动
-  if (deltaX > dragThreshold || deltaY > dragThreshold) {
+  // 越过过阈值才算拖动，抑制点击放置
+  if (hasDragged.value) {
     isDraggingForPlacement.value = true;
   }
-  
+
   isDragging.value = false;
+  hasDragged.value = false;
   if (canvasRef.value) {
-    canvasRef.value.style.cursor = isCoolingDown.value ? 'not-allowed' : 'pointer';
+    canvasRef.value.style.cursor = isCoolingDown.value || !drawEnabled.value || props.drawingLocked ? 'not-allowed' : 'pointer';
   }
 }
 
@@ -289,20 +310,67 @@ function updateHoverPixel(event) {
   }
 }
 
-// 悬停高亮样式
-const highlightStyle = computed(() => {
-  if (props.isMobile || hoverPixelX.value < 0 || hoverPixelY.value < 0 || isCoolingDown.value || isInteracting.value) return null;
-  const ps = props.pixelSize;
-  const s = scale.value;
-  const tx = translateX.value + hoverPixelX.value * ps * s;
-  const ty = translateY.value + hoverPixelY.value * ps * s;
-  const size = ps * s;
-  return {
-    transform: `translate(${tx}px, ${ty}px)`,
-    width: `${size}px`,
-    height: `${size}px`,
-  };
-});
+// 像素网格：仅在放大到单像素屏幕尺寸 >= 阈值时显示
+// 用独立 canvas 覆盖层在屏幕空间画 1 设备像素的硬边线条，并按设备像素取整，
+// 与像素化画布的硬边对齐，避免 CSS 渐变抗锯齿在分数缩放/平移下产生的亚像素偏移
+const GRID_THRESHOLD = 8; // 单像素在屏幕上 >= 8px 时才画网格
+const showGrid = computed(() => props.pixelSize * scale.value >= GRID_THRESHOLD);
+
+const gridCanvasRef = ref(null);
+let gridRafId = 0;
+let gridResizeObserver = null;
+
+function scheduleDrawGrid() {
+  if (gridRafId) return;
+  gridRafId = requestAnimationFrame(() => {
+    gridRafId = 0;
+    drawGrid();
+  });
+}
+
+function drawGrid() {
+  const canvas = gridCanvasRef.value;
+  const container = containerRef.value;
+  if (!canvas || !container) return;
+  const gctx = canvas.getContext('2d');
+  if (!gctx) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = container.clientWidth;
+  const cssH = container.clientHeight;
+  const bmpW = Math.max(1, Math.floor(cssW * dpr));
+  const bmpH = Math.max(1, Math.floor(cssH * dpr));
+  // 仅在位图尺寸变化时重设，避免每次重绘都清空
+  if (canvas.width !== bmpW || canvas.height !== bmpH) {
+    canvas.width = bmpW;
+    canvas.height = bmpH;
+  }
+
+  gctx.clearRect(0, 0, bmpW, bmpH);
+  if (!showGrid.value) return;
+
+  const cell = props.pixelSize * scale.value; // 单像素屏幕尺寸（CSS px）
+  const tx = translateX.value;
+  const ty = translateY.value;
+  gctx.fillStyle = 'rgba(0, 0, 0, 0.12)';
+
+  // 竖线：屏幕 x = tx + k*cell，按设备像素取整对齐像素边缘
+  const kMin = Math.ceil(-tx / cell);
+  const kMax = Math.floor((cssW - tx) / cell);
+  for (let k = kMin; k <= kMax; k++) {
+    const x = Math.floor((tx + k * cell) * dpr);
+    gctx.fillRect(x, 0, 1, bmpH);
+  }
+  // 横线
+  const jMin = Math.ceil(-ty / cell);
+  const jMax = Math.floor((cssH - ty) / cell);
+  for (let j = jMin; j <= jMax; j++) {
+    const y = Math.floor((ty + j * cell) * dpr);
+    gctx.fillRect(0, y, bmpW, 1);
+  }
+}
+
+watch([scale, translateX, translateY, () => props.pixelSize], scheduleDrawGrid, { flush: 'post' });
 
 // 中央准星（移动端）
 const crosshairPixel = computed(() => {
@@ -455,7 +523,7 @@ function handleTouchEnd(event) {
 
 // ============ 像素放置 ============
 function placeAtPoint(clientX, clientY) {
-  if (isCoolingDown.value) return;
+  if (isCoolingDown.value || !drawEnabled.value || props.drawingLocked || syncing.value) return;
   if (!containerRef.value) return;
 
   const { x: mx, y: my } = getLocalPosInContainer({ clientX, clientY });
@@ -465,8 +533,7 @@ function placeAtPoint(clientX, clientY) {
   const y = Math.floor(canvasY / props.pixelSize);
 
   if (x >= 0 && x < props.width && y >= 0 && y < props.height) {
-    ws.send('pixel_place', { x, y, color: props.selectedColor });
-    emit('pixel-placed');
+    placePixel(x, y);
   }
 }
 
@@ -487,12 +554,17 @@ function getCrosshairPixel() {
 }
 
 function placeAtCrosshair() {
-  if (isCoolingDown.value) return false;
+  if (isCoolingDown.value || !drawEnabled.value || props.drawingLocked || syncing.value) return false;
   const pos = getCrosshairPixel();
   if (!pos) return false;
-  ws.send('pixel_place', { x: pos.x, y: pos.y, color: props.selectedColor });
-  emit('pixel-placed');
-  return true;
+  return placePixel(pos.x, pos.y);
+}
+
+function pickAtCrosshair() {
+  if (syncing.value) return null;
+  const pos = getCrosshairPixel();
+  if (!pos) return null;
+  return { ...pos, color: readPixel(pos.x, pos.y) };
 }
 
 function zoomIn() {
@@ -533,27 +605,10 @@ function handleCanvasClick(event) {
   }
 
   // 如果在冷却中，则不执行像素放置
-  if (isCoolingDown.value) return;
+  if (isCoolingDown.value || !drawEnabled.value || props.drawingLocked || syncing.value) return;
 
   placeAtPoint(event.clientX, event.clientY);
 }
-
-// ============ 像素绘制 ============
-function handlePixelUpdate(data) {
-  drawPixel(data.x, data.y, data.color);
-}
-
-function drawFullCanvas(canvasData) {
-  if (!ctx.value) return;
-  ctx.value.clearRect(0, 0, baseCanvasWidth.value, baseCanvasHeight.value);
-  for (let y = 0; y < props.height; y++) {
-    for (let x = 0; x < props.width; x++) {
-      const color = canvasData[y * props.width + x];
-      drawPixel(x, y, color);
-    }
-  }
-}
-
 
 function drawPixel(x, y, color) {
   if (!ctx.value) return;
@@ -566,128 +621,133 @@ function drawPixel(x, y, color) {
   );
 }
 
-// imageData 是后端返回的 data URL 格式: "data:image/png;base64,..."
-// 直接把 PNG 快照绘制到画布上（1000x1000 按 pixelSize 缩放）
-function drawPNGImageFromDataURL(imageData) {
-  const startTime = performance.now();
+// ============ V2 initialization and optimistic pixels ============
+async function handleSessionReady(message) {
+  const ready = message.data;
+  syncing.value = true;
+  drawEnabled.value = Boolean(ready.draw_enabled);
+  emit('draw-enabled', drawEnabled.value);
+  bufferedEvents.length = 0;
+  latestEventByPixel.clear();
+  clearCanvas();
 
-  const img = new Image();
-  img.src = imageData;
-
-  img.onload = () => {
-    if (!ctx.value) return;
-
-    ctx.value.save();
-    ctx.value.imageSmoothingEnabled = false;
-    ctx.value.drawImage(img, 0, 0, baseCanvasWidth.value, baseCanvasHeight.value);
-    ctx.value.restore();
-
-    const endTime = performance.now();
-    console.log(`drawPNGImageFromDataURL 运行时长: ${endTime - startTime} 毫秒`);
-  };
-
-  img.onerror = (error) => {
-    console.error('加载 PNG 图像时出错:', error);
-    const endTime = performance.now();
-    console.log(`drawPNGImageFromDataURL 运行时长(失败): ${endTime - startTime} 毫秒`);
-  };
-}
-
-// 从后端获取最新图片数据并绘制到画布
-async function fetchAndDrawLatestImage() {
   try {
-    const response = await fetch('/api/v1/snapshots/latest/dataurl');
-    
-    // 检查响应是否成功
-    if (!response.ok) {
-      console.warn(`获取最新图片失败: ${response.status} ${response.statusText}`);
-      return;
+    let cursor = 0;
+    if (ready.snapshot) {
+      await drawPNGImage(ready.snapshot.url);
+      cursor = ready.snapshot.last_event_id;
     }
-    
-    // 检查内容类型
-    const contentType = response.headers.get('content-type');
-    if (!contentType || !contentType.includes('application/json')) {
-      console.warn('响应不是JSON格式:', contentType);
-      return;
+    while (cursor < ready.head_event_id) {
+      const response = await fetch(`/api/v2/canvas/events?after=${cursor}&through=${ready.head_event_id}&limit=5000`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error('无法获取画布增量');
+      const page = await response.json();
+      (page.events || []).forEach(applyConfirmedEvent);
+      if (!page.events?.length) break;
+      cursor = page.events[page.events.length - 1].event_id;
     }
-    
-    const data = await response.json();
-    
-    // 检查返回的数据是否包含需要的字段
-    if (!data.data_url) {
-      console.warn('返回的数据缺少data_url字段:', data);
-      return;
-    }
-    
-    // 使用返回的data_url数据绘制画布
-    drawPNGImageFromDataURL(data.data_url);
-    
-    return data;
+    bufferedEvents
+      .filter(event => event.event_id > ready.head_event_id)
+      .sort((a, b) => a.event_id - b.event_id)
+      .forEach(applyConfirmedEvent);
   } catch (error) {
-    console.error('获取或绘制最新图片时出错:', error);
+    console.error('画布 V2 同步失败', error);
+    drawEnabled.value = false;
+    emit('draw-enabled', false);
+  } finally {
+    bufferedEvents.length = 0;
+    // A closed socket does not blindly replay a placement. Keep the original
+    // request IDs visible so an explicit retry can stay idempotent after sync.
+    for (const pending of pendingPixels.values()) drawPixel(pending.x, pending.y, pending.color);
+    syncing.value = false;
   }
 }
 
-async function fetchAndDrawUpdate() {
-  try {
-    const response = await fetch('/api/v1/snapshots/update');
-    
-    // 检查响应是否成功
-    if (!response.ok) {
-      console.warn(`获取更新日志失败: ${response.status} ${response.statusText}`);
-      return null;
-    }
-    
-    // 检查内容类型
-    const contentType = response.headers.get('content-type');
-    if (!contentType || !contentType.includes('application/json')) {
-      console.warn('响应不是JSON格式:', contentType);
-      return null;
-    }
-    
-    const data = await response.json();
-    
-    // 检查返回的数据是否包含需要的字段
-    if (!data.logs) {
-      console.warn('返回的数据缺少logs字段:', data);
-      return null;
-    }
-    
-    // 使用返回的logs数据绘制画布
-    drawLogsToCanvas(data.logs);
-    
-    return data;
-  } catch (error) {
-    console.error('获取或绘制日志更新时出错:', error);
-    return null;
+function handlePixelUpdated(message) {
+  const event = message.data;
+  if (syncing.value) {
+    bufferedEvents.push(event);
+    return;
+  }
+  applyConfirmedEvent(event);
+}
+
+function applyConfirmedEvent(event) {
+  const key = `${event.x}:${event.y}`;
+  if ((latestEventByPixel.get(key) || 0) >= event.event_id) return;
+  latestEventByPixel.set(key, event.event_id);
+  drawPixel(event.x, event.y, event.color);
+  for (const [requestId, pending] of pendingPixels) {
+    if (pending.x === event.x && pending.y === event.y) pendingPixels.delete(requestId);
   }
 }
 
-// 将后端返回的logs数据绘制到画布上
-function drawLogsToCanvas(logs) {
-  if (!ctx.value || !logs || !Array.isArray(logs)) return;
-  
-  // 保存当前上下文状态
-  ctx.value.save();
-  ctx.value.imageSmoothingEnabled = false;
-  
-  // 绘制每个日志记录的像素
-  logs.forEach(log => {
-    // 确保日志数据有效
-    if (
-      typeof log.x === 'number' && 
-      typeof log.y === 'number' && 
-      typeof log.color === 'string'
-    ) {
-      // 检查边界
-      if (log.x >= 0 && log.x < props.width && log.y >= 0 && log.y < props.height) {
-        drawPixel(log.x, log.y, log.color);
+function handleServerError(message) {
+  const error = message.data || {};
+  if (message.request_id && pendingPixels.has(message.request_id)) {
+    const pending = pendingPixels.get(message.request_id);
+    pendingPixels.delete(message.request_id);
+    drawPixel(pending.x, pending.y, pending.previousColor);
+  }
+  if (error.code === 'canvas_read_only') {
+    drawEnabled.value = false;
+    emit('draw-enabled', false);
+  }
+  // `destructive_cooldown` only blocks overwriting non-white pixels. Keep
+  // this canvas interactive so the user can continue drawing on blank areas;
+  // the server remains the authority for every individual placement.
+  const blocksAllDrawing = error.code === 'rate_limited' || error.code === 'drawing_blocked';
+  if (blocksAllDrawing && error.retry_after) {
+    isCoolingDown.value = true;
+    window.setTimeout(() => { isCoolingDown.value = false; }, error.retry_after * 1000);
+  }
+}
+
+function handleCanvasReload() {
+  ws.close();
+  const url = window.location.protocol === 'https:' ? `wss://${window.location.host}/ws/canvas` : `ws://${window.location.host}/ws/canvas`;
+  ws.connect(url);
+}
+
+function handleReadOnlyChanged(message) {
+  drawEnabled.value = Boolean(message.data?.draw_enabled);
+  emit('draw-enabled', drawEnabled.value);
+}
+
+function placePixel(x, y) {
+  const requestId = crypto.randomUUID();
+  const previousColor = readPixel(x, y);
+  if (!ws.send('pixel.place', { x, y, color: props.selectedColor }, requestId)) return false;
+  pendingPixels.set(requestId, { x, y, previousColor, color: props.selectedColor });
+  drawPixel(x, y, props.selectedColor);
+  emit('pixel-placed');
+  return true;
+}
+
+function readPixel(x, y) {
+  if (!ctx.value) return '#FFFFFF';
+  const rgb = ctx.value.getImageData(x * props.pixelSize, y * props.pixelSize, 1, 1).data;
+  return `#${[rgb[0], rgb[1], rgb[2]].map(value => value.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+}
+
+function clearCanvas() {
+  if (!ctx.value) return;
+  ctx.value.fillStyle = '#FFFFFF';
+  ctx.value.fillRect(0, 0, baseCanvasWidth.value, baseCanvasHeight.value);
+}
+
+function drawPNGImage(url) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      if (ctx.value) {
+        ctx.value.imageSmoothingEnabled = false;
+        ctx.value.drawImage(image, 0, 0, baseCanvasWidth.value, baseCanvasHeight.value);
       }
-    }
+      resolve();
+    };
+    image.onerror = () => reject(new Error('无法加载快照'));
+    image.src = url;
   });
-  
-  // 恢复上下文状态
-  ctx.value.restore();
 }
 
 // ============ 边界约束（像素空间） ============
@@ -756,7 +816,7 @@ function handleCooldownEvent(event) {
     // console.log('冷却结束')
     // 立即更新游标样式
     if (canvasRef.value) {
-      canvasRef.value.style.cursor = 'pointer';
+      canvasRef.value.style.cursor = drawEnabled.value && !props.drawingLocked ? 'pointer' : 'not-allowed';
     }
   }
 }
@@ -767,6 +827,7 @@ defineExpose({
   zoomIn,
   zoomOut,
   placeAtCrosshair,
+  pickAtCrosshair,
   getCrosshairPixel,
 });
 </script>
@@ -783,11 +844,10 @@ defineExpose({
       class="pixel-canvas"
       :style="{ ...canvasTransformStyle, cursor: canvasCursor }"
     ></canvas>
-    <div
-      v-if="highlightStyle"
-      class="pixel-highlight"
-      :style="highlightStyle"
-    ></div>
+    <canvas
+      ref="gridCanvasRef"
+      class="pixel-grid-canvas"
+    ></canvas>
     <div
       v-if="crosshairStyle"
       class="crosshair"
@@ -821,14 +881,15 @@ defineExpose({
   -webkit-user-select: none;
 }
 
-.pixel-highlight {
+.pixel-grid-canvas {
   position: absolute;
   top: 0;
   left: 0;
-  background: rgba(99, 102, 241, 0.3);
-  border: 1.5px solid rgba(99, 102, 241, 0.8);
+  width: 100%;
+  height: 100%;
+  display: block;
   pointer-events: none;
-  z-index: 1;
+  z-index: 2;
 }
 
 .crosshair {

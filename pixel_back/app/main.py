@@ -1,66 +1,63 @@
-"""
-Main FastAPI application for the Pixel Canvas project.
-This file contains the core application setup, WebSocket handling, and API endpoints.
-"""
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.admin import router as admin_router
+from app.api.canvas import router as canvas_router
+from app.api.health import router as health_router
+from app.api.session import router as session_router
+from app.core.runtime import ApplicationRuntime
+from app.core.settings import Settings
 from app.websocket.endpoints import router as websocket_router
-from app.api.snapshots import router as snapshots_router
-from app.config import CANVAS_WIDTH, CANVAS_HEIGHT
-from app.deps import create_redis_pool
-import app.deps as deps
-from app.services.canvas_initializer import initialize_canvas_at_startup
-from app.services.stats_service import StatsService
 
-# Create FastAPI app
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    runtime = ApplicationRuntime(Settings.from_environment())
+    app.state.runtime = runtime
+    try:
+        await runtime.start()
+        yield
+    finally:
+        await runtime.stop()
+
+
+settings = Settings.from_environment()
 app = FastAPI(
-    title="Pixel Canvas API",
-    description="A Reddit r/place inspired real-time collaborative pixel canvas",
-    version="1.0.0"
+    title='Pixel Canvas API',
+    description='Single-process collaborative canvas with V2 synchronization.',
+    version='3.0.0',
+    lifespan=lifespan,
 )
+if settings.allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(settings.allowed_origins),
+        allow_credentials=True,
+        allow_methods=['GET', 'POST', 'PUT', 'DELETE'],
+        allow_headers=['Content-Type', 'X-CSRF-Token'],
+    )
 
-# Include routers
+app.include_router(health_router)
+app.include_router(session_router)
+app.include_router(canvas_router)
+app.include_router(admin_router)
 app.include_router(websocket_router)
-app.include_router(snapshots_router)
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize application on startup."""
-    # Create Redis connection pool
-    create_redis_pool()
-    print("Redis connection pool created")
-    
-    await StatsService.initialize_startup_counters()
-
-    # Initialize canvas
-    await initialize_canvas_at_startup()
-    print("Canvas initialization completed")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up application on shutdown."""
-    if deps.redis_pool:
-        await deps.redis_pool.disconnect()
-    print("Redis connection pool disconnected")
-
-
-@app.get("/")
-async def root():
-    """Root endpoint."""
+@app.get('/')
+async def root() -> dict:
     return {
-        "message": "Welcome to the Pixel Canvas API",
-        "canvas_size": f"{CANVAS_WIDTH}x{CANVAS_HEIGHT}"
+        'message': 'Pixel Canvas API',
+        'protocol': 'v2',
+        'session_endpoint': '/api/v2/session',
+        'websocket': '/ws/canvas',
     }
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy"}
-
-
-if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+if __name__ == '__main__':
+    uvicorn.run('app.main:app', host='0.0.0.0', port=8000, reload=True)

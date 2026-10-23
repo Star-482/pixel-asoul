@@ -5,12 +5,15 @@ import ColorPicker from './components/ColorPicker.vue';
 import CooldownTimer from './components/CooldownTimer.vue';
 import MobileToolbar from './components/MobileToolbar.vue';
 import FloatingToolbar from './components/FloatingToolbar.vue';
+import OverwriteCooldownModal from './components/OverwriteCooldownModal.vue';
 import ws from './utils/ws.js';
 
 // 状态管理
 const selectedColor = ref('#FF0000');
 const canvasBoard = ref(null);
 const cooldownTimer = ref(null);
+const drawEnabled = ref(false);
+const overwriteCooldown = ref(0);
 
 // 移动端状态
 const isMobile = ref(false);
@@ -38,6 +41,29 @@ function showToast(message, type = 'warning', duration = 3000) {
   setTimeout(() => {
     toasts.value = toasts.value.filter(t => t.id !== id);
   }, duration);
+}
+
+function handleServerError(message) {
+  const data = message.data || {};
+
+  // Overwrite cooling gets a dedicated modal: the message asks the visitor to
+  // respect others' work and points at the owner's contact page.
+  if (data.code === 'destructive_cooldown') {
+    overwriteCooldown.value = Math.max(1, Math.floor(data.retry_after || 0));
+    return;
+  }
+
+  showToast(data.message || '操作过于频繁，请稍后再试', 'warning');
+
+  // Rate limits and a temporary drawing block apply to every placement.
+  const blocksAllDrawing = data.code === 'rate_limited' || data.code === 'drawing_blocked';
+  if (blocksAllDrawing && data.retry_after) {
+    if (isMobile.value) {
+      startMobileCooldown(data.retry_after);
+    } else if (cooldownTimer.value) {
+      cooldownTimer.value.startCooldown(data.retry_after);
+    }
+  }
 }
 
 const cooldownEventBus = {
@@ -95,28 +121,37 @@ onMounted(() => {
     : `ws://${window.location.host}/ws/canvas`;
   ws.connect(wsUrl);
 
-  // 监听限制消息
-  ws.on('limited', (data) => {
-    showToast(data.error_message || '操作过于频繁，请稍后再试', 'warning');
-    if (isMobile.value) {
-      startMobileCooldown(data.limit_time);
-    } else if (cooldownTimer.value) {
-      cooldownTimer.value.startCooldown(data.limit_time);
-    }
+  ws.on('session.ready', (message) => {
+    const data = message.data?.stats || {};
+    stats.value = {
+      onlineCount: data.online_users || 0,
+      totalVisits: data.total_visits || 0,
+      totalPixels: data.total_placed_pixels || 0
+    };
   });
+
+  // V2 errors contain the retry interval and the originating request id.
+  ws.on('server_error', handleServerError);
 
   // 监听统计信息更新
   ws.on('stats', (data) => {
     stats.value = {
-      onlineCount: data.current_online_users || 0,
+      onlineCount: data.online_users || 0,
       totalVisits: data.total_visits || 0,
       totalPixels: data.total_placed_pixels || 0
     };
+  });
+
+  ws.on('pixel.updated', (message) => {
+    if (typeof message.data?.total_placed_pixels === 'number') {
+      stats.value.totalPixels = message.data.total_placed_pixels;
+    }
   });
 })
 
 onBeforeUnmount(() => {
   stopMobileCooldown();
+  ws.off('server_error', handleServerError);
   window.matchMedia('(max-width: 639px), (hover: none) and (pointer: coarse)').removeEventListener('change', checkMobile);
 });
 
@@ -152,10 +187,24 @@ function toggleInfo() {
 }
 
 function handlePlacePixel() {
+  if (!drawEnabled.value) {
+    showToast('当前画布仅允许浏览', 'warning');
+    return;
+  }
   const ok = canvasBoard.value?.placeAtCrosshair();
   if (!ok) {
     showToast('请将准星对准画布内再放置', 'warning');
   }
+}
+
+function handlePickColor() {
+  const picked = canvasBoard.value?.pickAtCrosshair();
+  if (!picked) {
+    showToast('画布尚未加载完成，或准星未对准画布内', 'warning');
+    return;
+  }
+  selectedColor.value = picked.color;
+  showToast(`已从画布取色 ${picked.color}`, 'success');
 }
 </script>
 
@@ -226,6 +275,7 @@ function handlePlacePixel() {
           ref="canvasBoard"
           :selected-color="selectedColor"
           :is-mobile="false"
+          @draw-enabled="drawEnabled = $event"
           @pixel-placed="() => {}"
         />
       </main>
@@ -239,11 +289,14 @@ function handlePlacePixel() {
             <li><span class="guide-key">绘制</span> 点击画布放置像素</li>
             <li><span class="guide-key">缩放</span> 鼠标滚轮缩放</li>
             <li><span class="guide-key">移动</span> 按住鼠标拖拽</li>
-            <li><span class="guide-key">限速</span> 放置频率平均 2/s</li>
             <li><span class="guide-key">协作</span> 与其他用户实时创作</li>
           </ul>
           <div class="tip-box">
-            点击吸管工具可吸取画布上的颜色，部分浏览器可能不支持。
+            桌面端吸管可从屏幕取色；不支持时可直接使用调色板或输入颜色。
+          </div>
+          <div class="tip-box collaboration-tip">
+            <strong>共同创作提醒</strong>
+            请尊重已有作品，请勿无意义覆盖、涂抹或破坏他人的创作。
           </div>
         </div>
 
@@ -252,6 +305,12 @@ function handlePlacePixel() {
             <img src="./assets/bilibili_play.png" alt="Bilibili" class="bili-icon" />
             <a href="https://www.bilibili.com/video/BV1wscrz3ERL" target="_blank" rel="noopener noreferrer">
               绘画过程可视化
+            </a>
+          </div>
+          <div class="bili-link">
+            <img src="./assets/bilibili_play.png" alt="Bilibili" class="bili-icon" />
+            <a href="https://space.bilibili.com/259253013" target="_blank" rel="noopener noreferrer">
+              联系站长
             </a>
           </div>
         </div>
@@ -267,6 +326,7 @@ function handlePlacePixel() {
             :selected-color="selectedColor"
             :is-mobile="true"
             :is-crosshair-mode="isCrosshairMode"
+            @draw-enabled="drawEnabled = $event"
             @pixel-placed="() => {}"
             @crosshair-change="crosshairCoord = $event"
           />
@@ -284,11 +344,12 @@ function handlePlacePixel() {
         :selected-color="selectedColor"
         :cooldown-seconds="mobileCooldown"
         :is-crosshair-mode="isCrosshairMode"
+        :disabled="!drawEnabled"
         :crosshair-coord="crosshairCoord"
         @open-color-picker="openColorPicker"
         @place-pixel="handlePlacePixel"
+        @pick-color="handlePickColor"
         @toggle-crosshair="toggleCrosshair"
-        @select-color="selectedColor = $event"
       />
 
       <!-- 移动端颜色选择抽屉 -->
@@ -316,13 +377,17 @@ function handlePlacePixel() {
               <ul class="guide-list">
                 <li><span class="guide-key">选色</span> 点击底部调色板</li>
                 <li><span class="guide-key">绘制</span> 对准准星后点击放置</li>
+                <li><span class="guide-key">取色</span> 对准准星后点击底部放大镜</li>
                 <li><span class="guide-key">缩放</span> 双指捏合或右侧按钮</li>
                 <li><span class="guide-key">移动</span> 单指拖拽画布</li>
-                <li><span class="guide-key">限速</span> 放置频率平均 2/s</li>
                 <li><span class="guide-key">协作</span> 与其他用户实时创作</li>
               </ul>
               <div class="tip-box">
-                建议开启准星模式以精确放置像素。
+                建议开启准星模式，以精确放置或从画布取色。
+              </div>
+              <div class="tip-box collaboration-tip">
+                <strong>共同创作提醒</strong>
+                请尊重已有作品，请勿无意义覆盖、涂抹或破坏他人的创作。
               </div>
             </div>
             <div class="card bili-card">
@@ -332,11 +397,20 @@ function handlePlacePixel() {
                   绘画过程可视化
                 </a>
               </div>
+              <div class="bili-link">
+                <img src="./assets/bilibili_play.png" alt="Bilibili" class="bili-icon" />
+                <a href="https://space.bilibili.com/259253013" target="_blank" rel="noopener noreferrer">
+                  联系站长
+                </a>
+              </div>
             </div>
           </div>
         </div>
       </Transition>
     </template>
+
+    <!-- 覆盖冷却提示弹窗 -->
+    <OverwriteCooldownModal :seconds="overwriteCooldown" @close="overwriteCooldown = 0" />
   </div>
 </template>
 
@@ -664,6 +738,19 @@ function handlePlacePixel() {
   line-height: 1.5;
 }
 
+.collaboration-tip {
+  margin-top: 10px;
+  background: #fff7ed;
+  border-color: #fed7aa;
+  color: #9a3412;
+}
+
+.collaboration-tip strong {
+  display: block;
+  margin-bottom: 2px;
+  font-weight: 700;
+}
+
 /* ===== 重置视图按钮 ===== */
 .reset-view-btn {
   display: flex;
@@ -695,6 +782,12 @@ function handlePlacePixel() {
 /* ===== B站链接 ===== */
 .bili-card {
   padding: 12px 16px;
+}
+
+.bili-card .bili-link + .bili-link {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-light);
 }
 
 .bili-link {

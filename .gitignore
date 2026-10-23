@@ -28,18 +28,23 @@ pixel_front/*.example
 #back
 pixel_back/AGENTS.md
 pixel_back/.idea/
-pixel_back/tests/
 pixel_back/.env
 pixel_back/*.sql
 pixel_back/*.bat
 pixel_back/*.sh
+!pixel_back/run.sh
 pixel_back/*.http
+pixel_back/snapshots/
 
 #python
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 
 
 #agent
 CLAUDE.md
+
+
+.env*

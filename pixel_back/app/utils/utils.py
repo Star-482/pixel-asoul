@@ -15,7 +15,9 @@ from ipaddress import ip_address
 from typing import Mapping, Optional
 
 
-def color_array_to_png(color_array: List[str], width: int, height: int, output_path: str = None) -> bytes:
+def color_array_to_png(
+    color_array: List[str], width: int, height: int, output_path: str | None = None
+) -> bytes:
     """
     将颜色数组转换为PNG图片格式
 
@@ -71,9 +73,10 @@ def color_array_to_png(color_array: List[str], width: int, height: int, output_p
     # 创建PIL图像
     img = Image.fromarray(img_array, 'RGB')
 
-    # 如果指定了输出路径，则保存到文件
+    # 如果指定了输出路径，则只写入一次文件。
     if output_path:
         img.save(output_path, 'PNG')
+        return b""
 
     # 将图像转换为字节数据
     from io import BytesIO
@@ -83,7 +86,9 @@ def color_array_to_png(color_array: List[str], width: int, height: int, output_p
 
     return img_bytes.getvalue()
 
-def png_to_color_array(png_path: str = None, png_bytes: bytes = None) -> List[str]:
+def png_to_color_array(
+    png_path: str | None = None, png_bytes: bytes | None = None
+) -> List[str]:
     """
     将PNG图像转换为十六进制颜色值数组
     
@@ -101,15 +106,15 @@ def png_to_color_array(png_path: str = None, png_bytes: bytes = None) -> List[st
     if not png_path and not png_bytes:
         raise ValueError("必须提供png_path或png_bytes参数")
     
-    # 加载图像
+    # 加载图像并立即复制转换结果，确保底层文件句柄及时关闭。
     if png_path:
-        img = Image.open(png_path)
+        with Image.open(png_path) as source_img:
+            img = source_img.convert('RGB')
     else:
+        assert png_bytes is not None
         from io import BytesIO
-        img = Image.open(BytesIO(png_bytes))
-    
-    # 转换为RGB模式（以防是RGBA或其他模式）
-    img = img.convert('RGB')
+        with Image.open(BytesIO(png_bytes)) as source_img:
+            img = source_img.convert('RGB')
     
     # 转换为numpy数组
     img_array = np.array(img)
@@ -177,6 +182,7 @@ def _clean_ip_candidate(value: Optional[str]) -> Optional[str]:
 def extract_client_ip(
     headers: Mapping[str, str],
     client_host: Optional[str] = None,
+    trust_proxy_headers: bool = False,
 ) -> Optional[str]:
     """
     Extract client IP behind reverse proxy.
@@ -186,26 +192,41 @@ def extract_client_ip(
     2) X-Real-IP
     3) direct client_host from socket
     """
-    xff = headers.get("x-forwarded-for")
-    ip = _clean_ip_candidate(xff)
-    if ip:
-        return ip
+    if trust_proxy_headers:
+        xff = headers.get("x-forwarded-for")
+        ip = _clean_ip_candidate(xff)
+        if ip:
+            return ip
 
-    xri = headers.get("x-real-ip")
-    ip = _clean_ip_candidate(xri)
-    if ip:
-        return ip
+        xri = headers.get("x-real-ip")
+        ip = _clean_ip_candidate(xri)
+        if ip:
+            return ip
 
     return _clean_ip_candidate(client_host)
 
 
-def extract_client_ip_from_websocket(websocket) -> Optional[str]:
+def extract_client_ip_from_websocket(
+    websocket,
+    trust_proxy_headers: bool = False,
+) -> Optional[str]:
     """FastAPI/Starlette WebSocket helper."""
     client_host = websocket.client.host if websocket.client else None
-    return extract_client_ip(websocket.headers, client_host)
+    return extract_client_ip(
+        websocket.headers,
+        client_host,
+        trust_proxy_headers=trust_proxy_headers,
+    )
 
 
-def extract_client_ip_from_request(request) -> Optional[str]:
+def extract_client_ip_from_request(
+    request,
+    trust_proxy_headers: bool = False,
+) -> Optional[str]:
     """FastAPI/Starlette Request helper."""
     client_host = request.client.host if request.client else None
-    return extract_client_ip(request.headers, client_host)
+    return extract_client_ip(
+        request.headers,
+        client_host,
+        trust_proxy_headers=trust_proxy_headers,
+    )

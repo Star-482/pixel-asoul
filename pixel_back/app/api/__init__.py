@@ -1,7 +1,1 @@
-"""
-API package for the Pixel Canvas project.
-"""
-
-from .snapshots import router
-
-__all__ = ["router"]
+"""HTTP adapters for the V2 public and administrator APIs."""
